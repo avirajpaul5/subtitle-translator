@@ -1,0 +1,14 @@
+{
+  "glossary": {
+    "Dhaka": "ঢাকা",
+    "Bengal": "বঙ্গ",
+    "Prime Minister": "প্রধানমন্ত্রী",
+    "Padma Bridge": "পদ্মা সেতু"
+  },
+  "do_not_translate": [
+    "OpenAI",
+    "Python",
+    "NVIDIA",
+    "UNESCO"
+  ]
+}
