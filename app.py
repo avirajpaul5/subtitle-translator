@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
 
 import streamlit as st
 
@@ -20,72 +19,36 @@ DEFAULT_GLOSSARY = {
 }
 
 
-DEFAULT_PROFILE: Dict[str, Any] = {
-    "backend": "indictrans2",
-    "model_path": "./models/indictrans2-en-indic",
-    "source_lang": "en",
-    "target_lang": "bn",
-    "chunk_size": 12,
-    "merge_min_chars": 60,
-    "max_line_length": 42,
-    "max_lines": 2,
-    "echo_mode": False,
-    "glossary": DEFAULT_GLOSSARY,
-}
-
-
 def _init_state() -> None:
     if "translated_text" not in st.session_state:
         st.session_state.translated_text = ""
-    if "profile" not in st.session_state:
-        st.session_state.profile = dict(DEFAULT_PROFILE)
-
-
-def _load_profile(uploaded_profile) -> None:
-    raw = uploaded_profile.getvalue().decode("utf-8")
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ValueError("Profile JSON must be an object")
-
-    profile = dict(DEFAULT_PROFILE)
-    profile.update({k: v for k, v in data.items() if k in DEFAULT_PROFILE})
-    st.session_state.profile = profile
 
 
 st.set_page_config(page_title="Local Subtitle Translator", layout="wide")
 _init_state()
 
-st.title("📝 Subtitle Translator (Local + Web MVP)")
-st.caption("Translate .srt/.vtt subtitles with local models, or test full flow in echo mode on web.")
+st.title("📝 Local Offline Subtitle Translator")
+st.caption("Translate .srt/.vtt English subtitles to Bengali using local models.")
 
 with st.sidebar:
     st.header("Settings")
-    uploaded_profile = st.file_uploader("Import profile (optional)", type=["json"])
-    if uploaded_profile:
-        try:
-            _load_profile(uploaded_profile)
-            st.success("Profile loaded.")
-        except Exception as exc:
-            st.error(f"Profile load failed: {exc}")
-
-    p = st.session_state.profile
-    backend = st.selectbox("Backend", ["indictrans2", "echo", "nllb"], index=["indictrans2", "echo", "nllb"].index(p["backend"]))
+    backend = st.selectbox("Backend", ["indictrans2", "echo", "nllb"], index=0)
     model_path = st.text_input(
         "Local model path",
-        value=p["model_path"],
-        help="For hosted quick tests, use Echo mode. For real translation, point to a local model path.",
+        value="./models/indictrans2-en-indic",
+        help="Path to local model directory. No cloud inference calls are used.",
     )
-    source_lang = st.selectbox("Source language", ["en", "hi", "bn"], index=["en", "hi", "bn"].index(p["source_lang"]))
-    target_lang = st.selectbox("Target language", ["bn", "hi", "en"], index=["bn", "hi", "en"].index(p["target_lang"]))
+    source_lang = st.selectbox("Source language", ["en", "hi", "bn"], index=0)
+    target_lang = st.selectbox("Target language", ["bn", "hi", "en"], index=0)
 
     st.subheader("Batch & Formatting")
-    chunk_size = st.slider("Batch chunk size", 1, 64, int(p["chunk_size"]))
-    merge_min_chars = st.slider("Merge cues below chars", 10, 200, int(p["merge_min_chars"]))
-    max_line_length = st.slider("Max line length", 20, 60, int(p["max_line_length"]))
-    max_lines = st.slider("Max lines per cue", 1, 4, int(p["max_lines"]))
+    chunk_size = st.slider("Batch chunk size", 1, 64, 12)
+    merge_min_chars = st.slider("Merge cues below chars", 10, 200, 60)
+    max_line_length = st.slider("Max line length", 20, 60, 42)
+    max_lines = st.slider("Max lines per cue", 1, 4, 2)
 
     st.subheader("Mode")
-    echo_mode = st.checkbox("Echo/test mode (skip real translation)", value=bool(p["echo_mode"]))
+    echo_mode = st.checkbox("Echo/test mode (skip real translation)", value=False)
 
 st.subheader("1) Upload subtitle")
 uploaded_file = st.file_uploader("Drop a .srt or .vtt file", type=["srt", "vtt"])
@@ -95,29 +58,9 @@ uploaded_glossary = st.file_uploader("Upload glossary JSON (optional)", type=["j
 if uploaded_glossary:
     glossary_raw = uploaded_glossary.getvalue().decode("utf-8")
 else:
-    glossary_raw = json.dumps(st.session_state.profile.get("glossary", DEFAULT_GLOSSARY), ensure_ascii=False, indent=2)
+    glossary_raw = json.dumps(DEFAULT_GLOSSARY, ensure_ascii=False, indent=2)
 
 glossary_raw = st.text_area("Glossary JSON", value=glossary_raw, height=220)
-
-export_profile = {
-    "backend": backend,
-    "model_path": model_path,
-    "source_lang": source_lang,
-    "target_lang": target_lang,
-    "chunk_size": chunk_size,
-    "merge_min_chars": merge_min_chars,
-    "max_line_length": max_line_length,
-    "max_lines": max_lines,
-    "echo_mode": echo_mode,
-    "glossary": json.loads(glossary_raw) if glossary_raw.strip() else DEFAULT_GLOSSARY,
-}
-
-st.download_button(
-    "Download profile (sync local/web)",
-    data=json.dumps(export_profile, ensure_ascii=False, indent=2).encode("utf-8"),
-    file_name="subtitle_translator_profile.json",
-    mime="application/json",
-)
 
 if uploaded_file:
     try:

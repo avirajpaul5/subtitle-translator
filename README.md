@@ -17,7 +17,6 @@ A desktop-style local web app for translating existing English subtitle files (`
 - Download translated subtitle in same format as input
 - Echo/test mode to validate parsing + writing pipeline without model inference
 - Translator abstraction with pluggable backends (`indictrans2`, `nllb`, `echo`)
-- Optional profile import/export JSON for local/web sync of settings + glossary
 
 ## Project structure
 
@@ -54,7 +53,7 @@ A desktop-style local web app for translating existing English subtitle files (`
    - Glossary replacements are then applied as post-processing.
 4. **Cue re-splitting**: merged cue translation is split back to original cue count using line and punctuation heuristics. This is robust for MVP but can be improved with alignment in future.
 
-## Setup (local)
+## Setup
 
 ```bash
 python -m venv .venv
@@ -68,30 +67,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Zero-cost web MVP (quick functionality testing)
-
-You can deploy this same Streamlit app for free to test functionality quickly:
-
-### Option A: Streamlit Community Cloud (recommended)
-
-1. Push this repo to GitHub.
-2. Open Streamlit Community Cloud and create a new app from this repo.
-3. Set entrypoint to `app.py`.
-4. Deploy.
-
-For quick no-cost verification, enable **Echo/test mode** in the app and run end-to-end upload → parse → process → download checks.
-
-> Note: true “offline/local-only model inference” cannot be guaranteed on free hosted web environments unless model files are present on the server filesystem and loaded locally.
-
-## Local ↔ web profile sync (optional)
-
-Use:
-- **Download profile (sync local/web)** in the UI on one environment.
-- **Import profile** in the other environment.
-
-This syncs backend selection, language controls, chunk/format parameters, echo mode, and glossary JSON.
-
-## Model setup (offline/local inference)
+## Model setup (offline)
 
 Place a local model folder and set **Local model path** in the app sidebar.
 
