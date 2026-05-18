@@ -43,9 +43,13 @@ def translate_document(
     all_terms = list(glossary.do_not_translate) + list(glossary.glossary_map.keys())
 
     total = len(chunks)
-    for offset in range(0, total, settings.chunk_size):
+    total_chunks = max(1, (total + settings.chunk_size - 1) // settings.chunk_size)
+    for chunk_idx, offset in enumerate(range(0, total, settings.chunk_size)):
         batch = chunks[offset : offset + settings.chunk_size]
         batch_texts = [item.text for item in batch]
+
+        if progress_cb:
+            progress_cb(chunk_idx / total_chunks, f"Translating {chunk_idx + 1}/{total_chunks}…")
 
         # Normalise ALL-CAPS stage directions so the model translates them
         # semantically rather than phonetically transliterating them.
@@ -77,8 +81,7 @@ def translate_document(
                 translated_cues[cue_idx] = translated_cues[cue_idx].with_text(formatted)
 
         if progress_cb:
-            progress = min(1.0, (offset + len(batch)) / max(total, 1))
-            progress_cb(progress, f"Translated {offset + len(batch)}/{total} merged chunks")
+            progress_cb((chunk_idx + 1) / total_chunks, f"Translated {chunk_idx + 1}/{total_chunks} chunks")
 
     return SubtitleDocument(format=document.format, cues=translated_cues, header_lines=document.header_lines)
 

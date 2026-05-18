@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
@@ -40,9 +41,17 @@ from subtitle_translator.parsers import (
     serialize_subtitle,
 )
 from subtitle_translator.pipeline import TranslationSettings, translate_document
+from subtitle_translator.speaker_detection import detect_speaker_names
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
 
 SUBTITLE_FILTER = "Subtitle files (*.srt *.vtt);;SRT (*.srt);;WebVTT (*.vtt);;All files (*)"
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m {secs:02d}s"
 
 
 class TranslateWorker(QObject):
@@ -94,6 +103,7 @@ class MainWindow(QMainWindow):
         self._translated_output: str = ""
         self._thread: QThread | None = None
         self._worker: TranslateWorker | None = None
+        self._translate_start_time: float | None = None
 
         self._build_ui()
         self.statusBar().showMessage("Open a .srt or .vtt file to begin.")
@@ -234,6 +244,10 @@ class MainWindow(QMainWindow):
         self._file_label.setText(f"{path.name}  ·  {len(document.cues)} cues")
         self._original_view.setPlainText(serialize_subtitle(document))
 
+        detected_names = detect_speaker_names(document)
+        if detected_names:
+            self._merge_detected_names(detected_names)
+
         if document.warnings:
             self.statusBar().showMessage(
                 f"Loaded with {len(document.warnings)} warning(s). See details on hover.",
@@ -274,6 +288,27 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "Write error", str(exc))
 
+    def _merge_detected_names(self, names: list[str]) -> None:
+        try:
+            existing = json.loads(self._glossary_edit.toPlainText())
+        except Exception:
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        dnt: list = existing.get("do_not_translate", [])
+        if not isinstance(dnt, list):
+            dnt = []
+        added = [n for n in names if n not in dnt]
+        dnt.extend(added)
+        existing["do_not_translate"] = dnt
+        self._glossary_edit.setPlainText(json.dumps(existing, ensure_ascii=False, indent=2))
+        if added:
+            self.statusBar().showMessage(
+                f"Auto-detected {len(added)} speaker name(s): {', '.join(added[:5])}"
+                + (" …" if len(added) > 5 else ""),
+                8000,
+            )
+
     @Slot()
     def _on_translate(self) -> None:
         if self._document is None:
@@ -297,6 +332,7 @@ class MainWindow(QMainWindow):
         self._translate_btn.setEnabled(False)
         self._save_btn.setEnabled(False)
         self._progress.setValue(0)
+        self._translate_start_time = time.monotonic()
         self.statusBar().showMessage("Translating…")
 
         self._thread = QThread()
@@ -321,7 +357,12 @@ class MainWindow(QMainWindow):
     @Slot(float, str)
     def _on_progress(self, value: float, message: str) -> None:
         self._progress.setValue(int(value * 100))
-        self.statusBar().showMessage(message)
+        if value > 0.01 and self._translate_start_time is not None:
+            elapsed = time.monotonic() - self._translate_start_time
+            remaining = elapsed / value * (1.0 - value)
+            self.statusBar().showMessage(f"{message}  —  ETA {_format_eta(remaining)}")
+        else:
+            self.statusBar().showMessage(message)
 
     @Slot(str)
     def _on_translate_finished(self, output: str) -> None:
@@ -330,12 +371,14 @@ class MainWindow(QMainWindow):
         self._progress.setValue(100)
         self._save_btn.setEnabled(True)
         self._translate_btn.setEnabled(True)
+        self._translate_start_time = None
         self.statusBar().showMessage("Translation complete.", 5000)
 
     @Slot(str)
     def _on_translate_failed(self, message: str) -> None:
         self._translate_btn.setEnabled(True)
         self._progress.setValue(0)
+        self._translate_start_time = None
         self.statusBar().showMessage("Translation failed.", 5000)
         QMessageBox.critical(self, "Translation failed", message)
 
