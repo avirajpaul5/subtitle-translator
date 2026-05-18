@@ -63,9 +63,35 @@ pip install -r requirements.txt
 
 ## Run
 
+Two front-ends are available — pick whichever you prefer.
+
+Native desktop GUI (PySide6):
+
+```bash
+python gui.py
+```
+
+Browser GUI (Streamlit):
+
 ```bash
 streamlit run app.py
 ```
+
+Both share the same parser, pipeline, glossary, and translator backends.
+
+## Tests
+
+```bash
+pytest -q
+```
+
+The test suite uses the `echo` backend, so no model weights are required.
+
+## File encoding
+
+Subtitle files are decoded using a fallback chain: UTF-8 with BOM, UTF-8, UTF-16,
+cp1252, then latin-1. This means common Windows-encoded `.srt` files load
+without manual conversion.
 
 ## Model setup (offline)
 
@@ -78,6 +104,18 @@ Example expected path (default in UI):
 ```
 
 If you want full offline runtime, pre-download model artifacts ahead of time and copy them into this path.
+
+A helper script is included to fetch a model from HuggingFace into the expected location:
+
+```bash
+python scripts/download_models.py                 # IndicTrans2 distilled 200M (~800 MB)
+python scripts/download_models.py --model 1B      # IndicTrans2 full 1B (~4.5 GB)
+python scripts/download_models.py --model nllb    # NLLB-200 distilled 600M (~2.5 GB)
+```
+
+The `models/` directory is gitignored. The default destination matches the
+default "Local model path" in both GUIs, so no extra configuration is needed
+after download.
 
 ## Sample glossary JSON
 

@@ -1,0 +1,24 @@
+1
+00:00:01,000 --> 00:00:03,500
+Hello and welcome to Dhaka.
+
+2
+00:00:04,000 --> 00:00:07,000
+This line has <i>italic</i> text
+spanning two lines.
+
+3
+00:00:08,000 --> 00:00:10,000 X1:200 X2:600
+A cue with extra timing settings.
+
+4
+00:00:11,000 --> 00:00:13,000
+OpenAI builds Python tools.
+
+5
+00:00:14,000 --> 00:00:16,000
+Bangladesh is on the Bay of Bengal.
+
+6
+00:00:17,000 --> 00:00:19,000
+The end.

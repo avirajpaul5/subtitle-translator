@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import List
 
 from subtitle_translator.models import Cue
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[।.!?。！？])\s+")
 
 
 @dataclass
@@ -42,11 +45,10 @@ def split_translated_chunk(translated_text: str, original_count: int) -> List[st
     if len(lines) == original_count:
         return lines
 
-    # Fallback: split by sentence-like punctuation to approximate original cue count.
-    rough_parts = [part.strip() for part in translated_text.replace("\n", " ").split("।") if part.strip()]
+    flat = translated_text.replace("\n", " ").strip()
+    rough_parts = [part.strip() for part in _SENTENCE_SPLIT_RE.split(flat) if part.strip()]
     if rough_parts and len(rough_parts) >= original_count:
-        mapped = [f"{p}।" if i < len(rough_parts) - 1 else p for i, p in enumerate(rough_parts)]
-        return _fit_count(mapped, original_count)
+        return _fit_count(rough_parts, original_count)
 
     return _fit_count(lines, original_count)
 
