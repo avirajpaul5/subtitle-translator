@@ -168,7 +168,7 @@ class MainWindow(QMainWindow):
         form.addRow("Target language", self._target_combo)
 
         self._chunk_size_spin = self._spin(1, 64, 12)
-        self._merge_min_spin = self._spin(10, 200, 60)
+        self._merge_min_spin = self._spin(0, 200, 0)
         self._max_line_spin = self._spin(20, 80, 42)
         self._max_lines_spin = self._spin(1, 4, 2)
         form.addRow("Batch chunk size", self._chunk_size_spin)
