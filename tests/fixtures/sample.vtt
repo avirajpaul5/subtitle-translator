@@ -1,0 +1,20 @@
+WEBVTT
+Kind: captions
+Language: en
+
+NOTE
+This is a comment block that should be ignored.
+
+00:00:01.000 --> 00:00:03.500
+Hello and welcome to Dhaka.
+
+intro
+00:00:04.000 --> 00:00:07.000
+This line has <i>italic</i> text
+spanning two lines.
+
+00:00:08.000 --> 00:00:10.000 align:start
+A cue with VTT settings.
+
+00:00:11.000 --> 00:00:13.000
+The end.

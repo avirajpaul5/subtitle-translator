@@ -12,6 +12,23 @@ class SubtitleParseError(ValueError):
     pass
 
 
+def decode_subtitle_bytes(data: bytes) -> str:
+    """Decode subtitle file bytes, tolerating common non-UTF-8 encodings.
+
+    Real-world .srt files frequently arrive in cp1252 or latin-1 (Windows tooling)
+    rather than UTF-8. We try a small priority list; latin-1 never raises so it is
+    the guaranteed fallback.
+    """
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16")
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1", errors="replace")
+
+
 def parse_subtitle(content: str, file_ext: str) -> SubtitleDocument:
     ext = file_ext.lower().strip(".")
     if ext == "srt":
@@ -22,11 +39,13 @@ def parse_subtitle(content: str, file_ext: str) -> SubtitleDocument:
 
 
 def parse_srt(content: str) -> SubtitleDocument:
-    blocks = re.split(r"\n\s*\n", content.strip().replace("\r\n", "\n"))
+    blocks = re.split(r"\n\s*\n", content.lstrip("﻿").strip().replace("\r\n", "\n"))
     cues: List[Cue] = []
-    for block in blocks:
-        lines = [line for line in block.split("\n") if line is not None]
-        if not lines:
+    warnings: List[str] = []
+
+    for block_num, block in enumerate(blocks, start=1):
+        lines = block.split("\n")
+        if not any(line.strip() for line in lines):
             continue
 
         idx = None
@@ -36,11 +55,15 @@ def parse_srt(content: str) -> SubtitleDocument:
             pointer = 1
 
         if pointer >= len(lines):
+            warnings.append(f"Block {block_num}: missing timing line, skipped")
             continue
 
         timing_match = TIMING_RE.match(lines[pointer].strip())
         if not timing_match:
-            raise SubtitleParseError(f"Invalid SRT timing line: {lines[pointer]}")
+            warnings.append(
+                f"Block {block_num}: invalid timing line {lines[pointer]!r}, skipped"
+            )
+            continue
         pointer += 1
         text_lines = lines[pointer:] or [""]
 
@@ -57,11 +80,11 @@ def parse_srt(content: str) -> SubtitleDocument:
     if not cues:
         raise SubtitleParseError("No cues found in SRT file")
 
-    return SubtitleDocument(format="srt", cues=cues)
+    return SubtitleDocument(format="srt", cues=cues, warnings=warnings)
 
 
 def parse_vtt(content: str) -> SubtitleDocument:
-    normalized = content.replace("\r\n", "\n")
+    normalized = content.lstrip("﻿").replace("\r\n", "\n")
     lines = normalized.split("\n")
     if not lines or not lines[0].strip().startswith("WEBVTT"):
         raise SubtitleParseError("VTT content must start with WEBVTT")
@@ -76,7 +99,9 @@ def parse_vtt(content: str) -> SubtitleDocument:
     blocks = re.split(r"\n\s*\n", body) if body else []
 
     cues: List[Cue] = []
-    for block in blocks:
+    warnings: List[str] = []
+
+    for block_num, block in enumerate(blocks, start=1):
         block_lines = block.split("\n")
         if not block_lines:
             continue
@@ -92,6 +117,7 @@ def parse_vtt(content: str) -> SubtitleDocument:
             timing_match = TIMING_RE.match(block_lines[1].strip())
 
         if not timing_match:
+            warnings.append(f"Block {block_num}: missing timing line, skipped")
             continue
 
         text_lines = block_lines[timing_line_idx + 1 :] or [""]
@@ -109,7 +135,9 @@ def parse_vtt(content: str) -> SubtitleDocument:
     if not cues:
         raise SubtitleParseError("No cues found in VTT file")
 
-    return SubtitleDocument(format="vtt", cues=cues, header_lines=header_lines)
+    return SubtitleDocument(
+        format="vtt", cues=cues, header_lines=header_lines, warnings=warnings
+    )
 
 
 def serialize_subtitle(document: SubtitleDocument) -> str:

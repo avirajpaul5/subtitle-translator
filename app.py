@@ -5,23 +5,23 @@ from pathlib import Path
 
 import streamlit as st
 
+from subtitle_translator.defaults import DEFAULT_GLOSSARY
 from subtitle_translator.glossary import GlossaryConfig, load_glossary_json
-from subtitle_translator.parsers import SubtitleParseError, parse_subtitle, serialize_subtitle
+from subtitle_translator.parsers import (
+    SubtitleParseError,
+    decode_subtitle_bytes,
+    parse_subtitle,
+    serialize_subtitle,
+)
 from subtitle_translator.pipeline import TranslationSettings, translate_document
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
-
-DEFAULT_GLOSSARY = {
-    "glossary": {
-        "Dhaka": "ঢাকা",
-        "Bangladesh": "বাংলাদেশ",
-    },
-    "do_not_translate": ["OpenAI", "Python"],
-}
 
 
 def _init_state() -> None:
     if "translated_text" not in st.session_state:
         st.session_state.translated_text = ""
+    if "last_file_name" not in st.session_state:
+        st.session_state.last_file_name = ""
 
 
 st.set_page_config(page_title="Local Subtitle Translator", layout="wide")
@@ -65,8 +65,18 @@ glossary_raw = st.text_area("Glossary JSON", value=glossary_raw, height=220)
 if uploaded_file:
     try:
         ext = Path(uploaded_file.name).suffix
-        content = uploaded_file.getvalue().decode("utf-8")
+        content = decode_subtitle_bytes(uploaded_file.getvalue())
         document = parse_subtitle(content, ext)
+
+        if uploaded_file.name != st.session_state.last_file_name:
+            st.session_state.translated_text = ""
+            st.session_state.last_file_name = uploaded_file.name
+
+        if document.warnings:
+            st.warning(
+                "Parser skipped {n} malformed block(s):\n- ".format(n=len(document.warnings))
+                + "\n- ".join(document.warnings)
+            )
 
         col1, col2 = st.columns(2)
         with col1:

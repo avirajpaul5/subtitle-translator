@@ -63,9 +63,35 @@ pip install -r requirements.txt
 
 ## Run
 
+Two front-ends are available — pick whichever you prefer.
+
+Native desktop GUI (PySide6):
+
+```bash
+python gui.py
+```
+
+Browser GUI (Streamlit):
+
 ```bash
 streamlit run app.py
 ```
+
+Both share the same parser, pipeline, glossary, and translator backends.
+
+## Tests
+
+```bash
+pytest -q
+```
+
+The test suite uses the `echo` backend, so no model weights are required.
+
+## File encoding
+
+Subtitle files are decoded using a fallback chain: UTF-8 with BOM, UTF-8, UTF-16,
+cp1252, then latin-1. This means common Windows-encoded `.srt` files load
+without manual conversion.
 
 ## Model setup (offline)
 

@@ -35,3 +35,4 @@ class SubtitleDocument:
     format: str  # srt | vtt
     cues: List[Cue] = field(default_factory=list)
     header_lines: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
