@@ -43,7 +43,7 @@ def protect_terms(texts: Iterable[str], terms: List[str]) -> Tuple[List[str], Di
     for idx, term in enumerate(ordered_terms):
         token = f"{TOKEN_PREFIX}{idx}{TOKEN_SUFFIX}"
         replacements[token] = term
-        pattern = re.compile(rf"\b{re.escape(term)}\b")
+        pattern = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
         protected_texts = [pattern.sub(token, text) for text in protected_texts]
 
     return protected_texts, replacements

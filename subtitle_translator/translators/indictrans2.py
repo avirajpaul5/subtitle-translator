@@ -69,6 +69,8 @@ class IndicTrans2Translator(BaseTranslator):
                 max_length=self.max_new_tokens,
                 num_beams=5,
                 num_return_sequences=1,
+                repetition_penalty=1.3,
+                no_repeat_ngram_size=3,
             )
 
         decoded = self.tokenizer.batch_decode(
