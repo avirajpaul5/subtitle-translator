@@ -12,10 +12,6 @@ class GlossaryConfig:
     do_not_translate: List[str]
 
 
-TOKEN_PREFIX = "__DNT_"
-TOKEN_SUFFIX = "__"
-
-
 def load_glossary_json(raw_text: str | None) -> GlossaryConfig:
     if not raw_text:
         return GlossaryConfig(glossary_map={}, do_not_translate=[])
@@ -35,28 +31,60 @@ def load_glossary_json(raw_text: str | None) -> GlossaryConfig:
     )
 
 
+# Matches an existing <dnt>...</dnt> span so we can skip re-wrapping its content.
+_EXISTING_DNT_RE = re.compile(r'<dnt>.*?</dnt>', re.DOTALL)
+
+
 def protect_terms(texts: Iterable[str], terms: List[str]) -> Tuple[List[str], Dict[str, str]]:
-    replacements: Dict[str, str] = {}
-    protected_texts = list(texts)
+    """Wrap each term in <dnt>...</dnt> tags.
 
-    ordered_terms = sorted({term for term in terms if term}, key=len, reverse=True)
-    for idx, term in enumerate(ordered_terms):
-        token = f"{TOKEN_PREFIX}{idx}{TOKEN_SUFFIX}"
-        replacements[token] = term
+    IndicTrans2 is trained with IndicTransToolkit which uses this exact tag
+    format for entity protection — the model knows to pass tag contents through
+    unchanged.  We split on existing <dnt> spans before applying each pattern
+    to prevent double-wrapping when a shorter term is a substring of a longer
+    one that was already protected.
+    """
+    if not terms:
+        return list(texts), {}
+
+    protected = list(texts)
+    ordered = sorted({t for t in terms if t}, key=len, reverse=True)
+
+    for term in ordered:
         pattern = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
-        protected_texts = [pattern.sub(token, text) for text in protected_texts]
+        new_protected = []
+        for text in protected:
+            # Split into [plain, dnt-span, plain, dnt-span, ...] parts so we
+            # only apply the pattern to the plain segments.
+            segments = _EXISTING_DNT_RE.split(text)
+            tags = _EXISTING_DNT_RE.findall(text)
+            result = []
+            for i, seg in enumerate(segments):
+                result.append(pattern.sub(r'<dnt>\g<0></dnt>', seg))
+                if i < len(tags):
+                    result.append(tags[i])
+            new_protected.append(''.join(result))
+        protected = new_protected
 
-    return protected_texts, replacements
+    # Return an empty replacements dict for API compatibility; callers pass it
+    # to restore_terms which no longer needs it with the <dnt> approach.
+    return protected, {}
 
 
 def restore_terms(texts: Iterable[str], replacements: Dict[str, str]) -> List[str]:
-    restored = []
+    """Strip <dnt> tags, preserving their contents.
+
+    If the model preserved a <dnt>TERM</dnt> span verbatim the content is
+    returned as-is.  If the model translated the content inside the tags that
+    translation is returned (usually still acceptable).  Broken tag fragments
+    are stripped so they never appear in viewer-facing output.
+    """
+    result = []
     for text in texts:
-        updated = text
-        for token, original in replacements.items():
-            updated = updated.replace(token, original)
-        restored.append(updated)
-    return restored
+        t = re.sub(r'<dnt>(.*?)</dnt>', r'\1', text, flags=re.DOTALL)
+        t = re.sub(r'</?dnt>', '', t).strip()
+        result.append(t)
+    return result
 
 
 def apply_glossary_overrides(texts: Iterable[str], glossary_map: Dict[str, str]) -> List[str]:
