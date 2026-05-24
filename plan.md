@@ -81,6 +81,109 @@ Made the existing `do_not_translate` list actually take effect at translation ti
 
 **Final state:** 19 tests pass. Dropping any English SRT into the GUI auto-populates a sensible `do_not_translate` list (proper names + non-naturalized foreign words) with zero per-movie config; the existing pipeline preserves those terms verbatim through translation via the `ZZIDnZZ` sentinel mechanism proven in Phase 1.
 
+## Phase 6 — production-evaluation fixes *(done)*
+
+Triage of a real Bengali translation surfaced corruption modes that smoke tests had missed:
+
+- **Sentinel debris leaking into output:** `BELLID114ZTOLLING`, `MENID209ZZ`, `USID134ZZHuh`, `DetectiveID28ZZ`, `Mary DebenhamID155ZZ`, plus Bengali letter-spell-out `( জেড. জেড. আই. ডি. 357জেড.` (~5–10% of cues).
+- **Auto-detector over-preservation:** stage-direction nouns (`BELL`, `HORN`, `CAMERA`, `MEN`, `CROWD`) treated as proper nouns. Common nouns capitalized at sentence start (`Detective`, `Doctor`, `Priest`, `Huh`) flagged as PROPN. Pronoun `US` mis-tagged as `GPE` (United States).
+
+**Root causes (two separate bugs):**
+
+1. **Auto-detector ran on raw cue text** including parenthesized stage directions, speaker labels, and HTML tags. spaCy POS-tags `(BELL TOLLING)` content as PROPN because of the caps.
+2. **`<dnt>` restoration regex** only matched the canonical `Z[ZS]I[DT]\d+Z*` and missed real-world corruption: prefix-fused (`MENID3ZZ`), suffix-fused (`ID0ZZHuh`), eaten-Z (`ID114Z`), and Indic letter-spell-out (`জেড. আই. ডি.`).
+
+**Fixes shipped:**
+
+- **`subtitle_translator/auto_dnt.py`**:
+  - `_clean_for_ner` strips parenthesized content, bracketed `[…]` stage directions, ALL-CAPS speaker labels, and HTML tags before feeding text to spaCy.
+  - `_NEVER_PRESERVE` blocklist for pronouns/interjections (`US`, `HE`, `SHE`, `IT`, `WE`, `HUH`, `UM`, …) prevents preserving things spaCy mis-tags as entities.
+  - `PROPN_NOENTITY_MAX_ZIPF = 4.0` — PROPN-tagged tokens without an NER entity label require low corpus frequency. Catches `Detective`/`Doctor`/`Priest`/`Huh` at sentence start while still keeping NER-missed names like `Carol`.
+  - All-tokens-blocklisted entities (e.g., spaCy tagging `US` as GPE) are dropped wholesale.
+- **`subtitle_translator/glossary.py`**:
+  - `protect_terms` now pads sentinels with spaces (` ZZID0ZZ `), which empirically prevents the fusion-with-neighbour failures.
+  - `restore_terms` rewritten with three passes: Bengali letter-spell-out, Hindi letter-spell-out, then Latin sentinel-with-context. Requires leading or trailing `Z` (so it never matches stray English like `kid3` or `Sid8`). Multi-word saved terms with last-word-prefix fusion (`Mary DebenhamID0ZZ`) emit only the last word to avoid duplicating.
+  - Orphan-sentinel sweep nukes any debris for sentinel indices we never assigned.
+- **17 new regression tests** in `tests/test_auto_dnt.py` and `tests/test_pipeline.py` covering every corruption mode and every false-positive class observed.
+
+**End-to-end verification** (`scripts/smoke_pipeline_dnt.py`, real IndicTrans2):
+- 21/21 protected terms survive across Hindi, Bengali, Tamil.
+- Zero `ZZID*` / `জেড` / `जेड` debris in output.
+- Zero leaks of `BELL` / `MEN` / `HORN` / `US` / `Detective` / `Huh` into the auto-preserve list.
+
+**Test suite:** 36 tests pass (was 19).
+
+## Phase 7 — universal quality framework (defaults + validation) *(done)*
+
+Implements the scalable per-film quality layer described in `CLAUDE.md`:
+
+1. **Per-target-language glossary defaults** in `subtitle_translator/defaults.py`:
+   - `PER_LANG_GLOSSARY["bn"]` covers the common-English-words-the-model-doesn't-translate problem (professions, nationalities, language names, everyday nouns).
+   - `UNIVERSAL_DNT` covers foreign-language phrases that should always be preserved across every target (`Monsieur`, `Señor`, `Herr`, `Habibi`, `Tovarishch`, etc.).
+   - `merge_with_defaults()` unions both with the user-supplied glossary at translation time; user entries win on collision.
+   - Per-language isolation: Bengali defaults never bleed into a Hindi/Tamil translation request.
+
+2. **Post-translation validation** in `subtitle_translator/validation.py`:
+   - Corruption patterns per target language (Latin sentinel debris universally; `জেড` / `जेड` letter-spell-out for Bengali/Hindi/Marathi/Nepali).
+   - Grammar pattern detection (universal: repeated-word, English-mid-Indic; Bengali: `আমি একটি X ছিল` subject/verb mismatch).
+   - `validate_translation()` returns `ValidationIssue` records — one per dirty cue, never auto-corrects.
+   - Wired into the bottom of `translate_document()`; issues append to `SubtitleDocument.warnings`.
+   - Carefully avoids Python's `\b` and `\w` on Indic text (combining marks like Bengali `ি` have category `Mc`, which breaks `\w`).
+
+3. **GUI surfaces validation warnings** — `gui.TranslateWorker.finished` now emits `(text, warnings)`; the status bar shows the flag count with full list on hover.
+
+4. **24 new tests** covering: defaults merge precedence, per-language isolation, universal DNT protection through the pipeline, corruption detection (all language variants), grammar flagging, and the validation-report payload shape.
+
+**End-to-end verification** (`scripts/smoke_pipeline_dnt.py`):
+- 21/21 preservation across Hindi/Bengali/Tamil
+- Per-language defaults observably active: Bengali output shows `গোয়েন্দা Smith` (Detective translated, name preserved); Hindi/Tamil keep `Detective Smith` since their default maps aren't populated yet
+- Zero `ZZID*` / `জেড` / `जेड` debris
+
+**Test suite:** 60 tests pass (was 36).
+
+## Phase 8 — V3-regression triage *(done)*
+
+User triaged a translated Bengali SRT against V1/V2/V3 and surfaced:
+
+**V3 regressions (introduced by Phase 7 default glossary):**
+- `CHIEF INSPECTOR:` → `CHIEF পরিদর্শক:` — Bengali default `inspector → পরিদর্শক` was applied word-level to the speaker label.
+- `Monsieur 210ZZ` — new sentinel debris mode: model strips `ZZID` prefix entirely, leaving just `<num>ZZ`. Restoration regex required `[Ii][Dd]` to fire.
+
+**Stubborn issues across all 3 versions (model-level, can flag but not fix):**
+- `চিোকার` — two consecutive Bengali vowel signs on one consonant (invalid Unicode).
+- `( আইএন জেডজেড187জেডজেড )` — Bengali letter spell-out variant not covered by existing regexes.
+- `আমি একটি ভাল সপ্তাহ ছিল` — subject/verb mismatch grammar bug; existing pattern was too narrow (only allowed one intervening word).
+- `বাইউক`/`বিউইক` — character name "Bouc" transliterated. *Not fixable without per-movie glossary or different model* (no regex can know it's a name).
+
+**Fixes shipped:**
+
+- **`subtitle_translator/pipeline.py`**: extracted `_translate_speaker_label()`. Speaker labels now match the glossary as a *full key only* (case-insensitive), not via word-level substitution. User can still map `"POIROT" → "পয়রট"`, but `"CHIEF INSPECTOR"` no longer gets word-translated by the Bengali default `inspector → পরিদর্শক`.
+
+- **`subtitle_translator/glossary.py`**: new restoration pass `_SENTINEL_ID_STRIPPED_RE = r"(?<![A-Za-z\d])(\d{1,4})Z{2,}(?![A-Za-z\d])"`. Recognises `<num>ZZ` debris where the model dropped `ZZID` entirely; looks up the index in the replacements map and substitutes back. Orphan sweep extended to wipe leftovers.
+
+- **`subtitle_translator/validation.py`**:
+  - Universal corruption now includes `(?<![A-Za-z\d])\d{1,4}Z{2,}(?![A-Za-z\d])` (catches `210ZZ`).
+  - Bengali corruption adds `আইএন\s*জেড` (the `IN ZZ…` letter-spell-out from line 31) and `[া-ৌ]{2,}` (consecutive Bengali vowel signs — flags `চিোকার`).
+  - Grammar pattern loosened to allow 1–3 Bengali words between `একটি` and `ছিল`, so `আমি একটি ভাল সপ্তাহ ছিল` fires.
+
+- **6 new regression tests**, one per evaluation row.
+
+**End-to-end smoke**: 21/21 preservation across Hindi/Bengali/Tamil, zero debris, no new regressions.
+
+**Test suite:** 66 tests pass (was 60).
+
+### Honest accounting of what *cannot* be fixed
+
+The user asked "is there a way to fix these issues reliably all the time irrespective of which movie is being translated?" Three of the eval's stubborn issues are genuinely model-level — no post-processing can fix them reliably:
+
+| Issue | Why unfixable | What this codebase does |
+|---|---|---|
+| Character name transliteration (`বাইউক`) | No regex can know `Bouc` is a name vs. a rare foreign word vs. a misspelling. The auto-detector tries (spaCy NER + PROPN + wordfreq), but recall is <100% on rare/period-piece names. | Auto-detection runs at file open; user reviews the suggested DNT list and adds anything missed. |
+| Wrong Unicode characters in model output (`চিোকার`) | Post-processing cannot guess what the intended consonant cluster was. | Validation flags it; human review required. |
+| Persistent grammar errors | No automated rewriter can produce a grammatical sentence with the original semantics. | Validation flags; human review. |
+
+The framework's *real* contribution is making the per-movie work shrink to: review the auto-detected DNT list at file-open, then review the validation warnings after translation. Everything else is universal and scales automatically.
+
 ---
 
 ## Out of scope (intentionally deferred)

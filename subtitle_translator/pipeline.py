@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, List
 
+from subtitle_translator.defaults import merge_with_defaults
 from subtitle_translator.formatter import subtitle_line_break
 from subtitle_translator.glossary import (
     GlossaryConfig,
@@ -13,6 +14,7 @@ from subtitle_translator.glossary import (
 )
 from subtitle_translator.models import Cue, SubtitleDocument
 from subtitle_translator.segmentation import merge_short_cues, split_translated_chunk
+from subtitle_translator.validation import validate_translation
 
 # Matches lines that are entirely a parenthetical stage direction in ALL CAPS,
 # e.g. "(BELL TOLLING)" or "(SPEAKS FRENCH)" — including multi-word with spaces/hyphens.
@@ -43,6 +45,15 @@ def translate_document(
     glossary: GlossaryConfig,
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> SubtitleDocument:
+    # Merge built-in defaults with the user-supplied glossary. The per-target-
+    # language map covers common English nouns/verbs the model leaves
+    # untranslated; the universal DNT list covers foreign-language phrases
+    # ("Monsieur", "Señor", "Habibi") that are intentionally preserved.
+    merged_map, merged_dnt = merge_with_defaults(
+        glossary.glossary_map, glossary.do_not_translate, settings.target_lang
+    )
+    glossary = GlossaryConfig(glossary_map=merged_map, do_not_translate=merged_dnt)
+
     chunks = merge_short_cues(document.cues, min_chars=settings.merge_min_chars)
     translated_cues: List[Cue] = [cue for cue in document.cues]
 
@@ -87,13 +98,14 @@ def translate_document(
         # stripped them (it sometimes drops surrounding punctuation).
         translated_batch = _restore_stage_direction_parens(translated_batch, stage_flags)
 
-        # Reattach speaker labels.  Apply any glossary mapping so "POIROT"
-        # becomes "পোয়ারো" if the user has that entry; otherwise the label
-        # stays in its original (usually all-caps) form.
+        # Reattach speaker labels. Use full-name glossary lookup only —
+        # NOT word-level substitution. Word-level was rewriting
+        # "CHIEF INSPECTOR" into "CHIEF পরিদর্শক" because the default
+        # Bengali glossary contains "inspector". User can still get
+        # "POIROT" → "পয়রট" by adding the whole label as a glossary key.
         translated_batch = [
-            "{}: {}".format(
-                apply_glossary_overrides([name], glossary.glossary_map)[0], text
-            ) if name else text
+            "{}: {}".format(_translate_speaker_label(name, glossary.glossary_map), text)
+            if name else text
             for name, text in zip(speaker_names, translated_batch)
         ]
 
@@ -110,7 +122,23 @@ def translate_document(
         if progress_cb:
             progress_cb((chunk_idx + 1) / total_chunks, f"Translated {chunk_idx + 1}/{total_chunks} chunks")
 
-    return SubtitleDocument(format=document.format, cues=translated_cues, header_lines=document.header_lines)
+    # Post-translation validation: flag (don't auto-fix) sentinel debris and
+    # grammar patterns indicating poor translations. Surfaces in the
+    # SubtitleDocument's `warnings` list — the GUI shows it in the status bar.
+    issues = validate_translation(
+        original_texts=[c.text for c in document.cues],
+        translated_texts=[c.text for c in translated_cues],
+        cue_numbers=[c.index for c in document.cues],
+        target_lang=settings.target_lang,
+    )
+    warnings = list(document.warnings) + [issue.formatted() for issue in issues]
+
+    return SubtitleDocument(
+        format=document.format,
+        cues=translated_cues,
+        header_lines=document.header_lines,
+        warnings=warnings,
+    )
 
 
 def _extract_speaker_label(text: str):
@@ -119,6 +147,17 @@ def _extract_speaker_label(text: str):
     if m:
         return m.group(1).strip(), text[m.end():]
     return None, text
+
+
+def _translate_speaker_label(name: str, glossary_map: dict) -> str:
+    """Look up the *full* speaker label as a single key (case-insensitive).
+    Avoids word-by-word substitution that would translate component words
+    like "INSPECTOR" inside "CHIEF INSPECTOR" via a generic default glossary."""
+    target = name.casefold()
+    for k, v in glossary_map.items():
+        if k.casefold() == target:
+            return v
+    return name
 
 
 def _normalise_stage_directions(texts: List[str]):

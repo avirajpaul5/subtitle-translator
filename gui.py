@@ -62,7 +62,7 @@ def _format_eta(seconds: float) -> str:
 class TranslateWorker(QObject):
     progress = Signal(float, str)
     model_loaded = Signal()   # fires once the model is in memory, before translation
-    finished = Signal(str)
+    finished = Signal(str, list)  # serialized output, validation warnings
     failed = Signal(str)
 
     def __init__(
@@ -92,7 +92,7 @@ class TranslateWorker(QObject):
                 glossary=self._glossary,
                 progress_cb=lambda v, m: self.progress.emit(v, m),
             )
-            self.finished.emit(serialize_subtitle(translated))
+            self.finished.emit(serialize_subtitle(translated), list(translated.warnings))
         except (SubtitleParseError, TranslatorInitError) as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
@@ -408,15 +408,26 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(message)
 
-    @Slot(str)
-    def _on_translate_finished(self, output: str) -> None:
+    @Slot(str, list)
+    def _on_translate_finished(self, output: str, warnings: list) -> None:
         self._translated_output = output
         self._translated_view.setPlainText(output)
         self._progress.setValue(100)
         self._save_btn.setEnabled(True)
         self._translate_btn.setEnabled(True)
         self._translate_start_time = None
-        self.statusBar().showMessage("Translation complete.", 5000)
+        if warnings:
+            preview = warnings[0]
+            extra = f" (+{len(warnings) - 1} more)" if len(warnings) > 1 else ""
+            self.statusBar().showMessage(
+                f"Translation complete. {len(warnings)} cue(s) flagged for review — "
+                f"hover for details: {preview}{extra}",
+                15000,
+            )
+            self.statusBar().setToolTip("\n".join(warnings))
+        else:
+            self.statusBar().showMessage("Translation complete. No issues flagged.", 5000)
+            self.statusBar().setToolTip("")
 
     @Slot(str)
     def _on_translate_failed(self, message: str) -> None:

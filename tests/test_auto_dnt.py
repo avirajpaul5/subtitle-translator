@@ -120,6 +120,102 @@ def test_zipf_threshold_separates_common_from_rare():
         assert zipf_frequency(w, "en") < DEFAULT_ZIPF_THRESHOLD, w
 
 
+# --- Regression tests against patterns from production evaluation -------
+# Each case below was a real false positive observed in a Bengali translation
+# of an English SRT — sound-effect words leaking into the preserve list,
+# pronouns mis-tagged as places, common nouns capitalized at sentence start.
+# All assertions are about behaviour, never specific film content.
+
+def test_excludes_parenthesized_stage_directions():
+    """Sound-effect / stage-direction content inside (…) should never go
+    into the preserve list — those words must be translated semantically."""
+    doc = _doc(
+        "(BELL TOLLING)",
+        "(CROWD CLAMORING)",
+        "(MEN SHOUTING)",
+        "(HORN HONKING)",
+        "(CAMERA CLICKING)",
+        "(DOOR SLAMS)",
+    )
+    detected = set(detect_preserve_spans(doc))
+    leaked = {"BELL", "CROWD", "MEN", "HORN", "CAMERA", "DOOR",
+              "TOLLING", "CLAMORING", "SHOUTING", "HONKING", "CLICKING", "SLAMS"}
+    assert detected.isdisjoint(leaked)
+
+
+def test_excludes_bracketed_stage_directions():
+    """[ALL CAPS] style brackets are also stage directions."""
+    doc = _doc("[MUSIC PLAYING] She walked away.")
+    detected = set(detect_preserve_spans(doc))
+    assert "MUSIC" not in detected
+    assert "PLAYING" not in detected
+
+
+def test_excludes_speaker_labels():
+    """ALL-CAPS SPEAKER: prefixes are handled by the pipeline separately;
+    they must not contribute to the preserve list."""
+    doc = _doc(
+        "POIROT: Good morning.",
+        "CHIEF INSPECTOR: The case is closed.",
+    )
+    detected = set(detect_preserve_spans(doc))
+    assert "POIROT" not in detected
+    assert "CHIEF" not in detected
+    assert "INSPECTOR" not in detected
+
+
+def test_excludes_common_nouns_capitalized():
+    """Common nouns that get PROPN-tagged due to capitalization (titles or
+    sentence start) shouldn't slip into preserve list."""
+    doc = _doc(
+        "Detective arrived early.",
+        "The Doctor examined the patient.",
+        "Priest walked into the church.",
+        "Huh, that is strange.",
+    )
+    detected_lower = {d.lower() for d in detect_preserve_spans(doc)}
+    common_capitalised = {"detective", "doctor", "priest", "huh"}
+    assert detected_lower.isdisjoint(common_capitalised)
+
+
+def test_excludes_pronouns_misframed_as_entities():
+    """spaCy parses standalone 'US' as GPE=United States; preserve-list
+    must filter those out via the pronoun blocklist."""
+    doc = _doc(
+        "US, we should talk.",
+        "He went home. She stayed.",
+        "It was a long day.",
+    )
+    detected = set(detect_preserve_spans(doc))
+    pronouns = {"US", "He", "She", "It", "Him", "Her", "Them"}
+    assert detected.isdisjoint(pronouns)
+
+
+def test_keeps_real_names_alongside_filtering():
+    """The aggressive filtering above must not regress: real names in cues
+    that also contain stage directions / pronouns should still be detected."""
+    doc = _doc(
+        "(BELL TOLLING)",
+        "POIROT: Mary Debenham just arrived at Yokohama.",
+        "US, we should ask Alice about it.",
+    )
+    detected = set(detect_preserve_spans(doc))
+    assert "Mary Debenham" in detected
+    assert "Yokohama" in detected
+    assert "Alice" in detected
+
+
+def test_html_formatting_tags_dont_leak():
+    """Italic/bold tags get stripped before NER — the closing tag fragment
+    must not produce a fake preserve entry."""
+    doc = _doc("She said <i>au revoir</i> at the door.")
+    detected = set(detect_preserve_spans(doc))
+    leaked = {"i", "au revoir</i", "italic</i"}
+    # The wrapping tag never becomes an entry; the foreign phrase is fine
+    # though wordfreq may or may not catch it as a unit.
+    assert all(t not in leaked for t in detected)
+
+
 # --- Sanity pass against the in-repo sample SRT --------------------------
 # Property-based: never assert specific terms (the fixture's content may
 # evolve), only structural invariants.
