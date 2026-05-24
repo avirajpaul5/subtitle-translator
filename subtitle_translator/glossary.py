@@ -31,59 +31,64 @@ def load_glossary_json(raw_text: str | None) -> GlossaryConfig:
     )
 
 
-# Matches an existing <dnt>...</dnt> span so we can skip re-wrapping its content.
-_EXISTING_DNT_RE = re.compile(r'<dnt>.*?</dnt>', re.DOTALL)
+# Bracket-free, all-alpha sentinels (ZZID{n}ZZ) survive IndicTrans2 verbatim.
+# Tried `<dnt>...</dnt>` and `<IDn>`: both have their brackets stripped or
+# garbled by the model (Â/dntÂ, w/dntw, <ID0′, etc.) — see scripts/spike_dnt.py.
+# Pure alphabetic sequences are treated as opaque foreign tokens and passed
+# through untouched.
+_SENTINEL_PREFIX = "ZZID"
+_SENTINEL_SUFFIX = "ZZ"
+
+
+def _sentinel(n: int) -> str:
+    return f"{_SENTINEL_PREFIX}{n}{_SENTINEL_SUFFIX}"
 
 
 def protect_terms(texts: Iterable[str], terms: List[str]) -> Tuple[List[str], Dict[str, str]]:
-    """Wrap each term in <dnt>...</dnt> tags.
+    """Replace each term with a ZZID{n}ZZ sentinel.
 
-    IndicTrans2 is trained with IndicTransToolkit which uses this exact tag
-    format for entity protection — the model knows to pass tag contents through
-    unchanged.  We split on existing <dnt> spans before applying each pattern
-    to prevent double-wrapping when a shorter term is a substring of a longer
-    one that was already protected.
+    Returns the substituted texts plus a replacements map (sentinel → original)
+    that `restore_terms` uses to put the originals back. The same term across
+    different texts gets the same sentinel ID so the map stays compact.
     """
     if not terms:
         return list(texts), {}
 
-    protected = list(texts)
     ordered = sorted({t for t in terms if t}, key=len, reverse=True)
+    term_to_sentinel: Dict[str, str] = {
+        term: _sentinel(i) for i, term in enumerate(ordered)
+    }
 
-    for term in ordered:
-        pattern = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
-        new_protected = []
-        for text in protected:
-            # Split into [plain, dnt-span, plain, dnt-span, ...] parts so we
-            # only apply the pattern to the plain segments.
-            segments = _EXISTING_DNT_RE.split(text)
-            tags = _EXISTING_DNT_RE.findall(text)
-            result = []
-            for i, seg in enumerate(segments):
-                result.append(pattern.sub(r'<dnt>\g<0></dnt>', seg))
-                if i < len(tags):
-                    result.append(tags[i])
-            new_protected.append(''.join(result))
-        protected = new_protected
+    protected: List[str] = []
+    for text in texts:
+        out = text
+        for term, sentinel in term_to_sentinel.items():
+            out = re.sub(rf"\b{re.escape(term)}\b", sentinel, out, flags=re.IGNORECASE)
+        protected.append(out)
 
-    # Return an empty replacements dict for API compatibility; callers pass it
-    # to restore_terms which no longer needs it with the <dnt> approach.
-    return protected, {}
+    replacements = {sentinel: term for term, sentinel in term_to_sentinel.items()}
+    return protected, replacements
+
+
+# Tolerant matcher: in addition to the canonical ZZID{n}ZZ, accept:
+#  - extra/missing trailing Z's
+#  - single-letter swaps in the prefix (the model occasionally turns D → T,
+#    producing forms like ZZIT4ZZ)
+# Z[ZS] handles ZS where the model swaps in S; I[DT] handles D↔T.
+_SENTINEL_RE = re.compile(r"Z[ZS]I[DT](\d+)Z*", re.IGNORECASE)
 
 
 def restore_terms(texts: Iterable[str], replacements: Dict[str, str]) -> List[str]:
-    """Strip <dnt> tags, preserving their contents.
+    """Substitute ZZID{n}ZZ sentinels back to their original terms."""
+    if not replacements:
+        return [t.strip() for t in texts]
 
-    If the model preserved a <dnt>TERM</dnt> span verbatim the content is
-    returned as-is.  If the model translated the content inside the tags that
-    translation is returned (usually still acceptable).  Broken tag fragments
-    are stripped so they never appear in viewer-facing output.
-    """
-    result = []
+    result: List[str] = []
     for text in texts:
-        t = re.sub(r'<dnt>(.*?)</dnt>', r'\1', text, flags=re.DOTALL)
-        t = re.sub(r'</?dnt>', '', t).strip()
-        result.append(t)
+        def _sub(match: re.Match) -> str:
+            key = _sentinel(int(match.group(1)))
+            return replacements.get(key, match.group(0))
+        result.append(_SENTINEL_RE.sub(_sub, text).strip())
     return result
 
 

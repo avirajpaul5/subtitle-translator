@@ -7,3 +7,5 @@ sacremoses>=0.1.1
 indic-transliteration>=2.3
 PySide6>=6.6.0
 pytest>=8.0.0
+spacy>=3.8
+wordfreq>=3.1

@@ -8,6 +8,8 @@ from subtitle_translator.formatter import subtitle_line_break
 from subtitle_translator.glossary import (
     GlossaryConfig,
     apply_glossary_overrides,
+    protect_terms,
+    restore_terms,
 )
 from subtitle_translator.models import Cue, SubtitleDocument
 from subtitle_translator.segmentation import merge_short_cues, split_translated_chunk
@@ -66,16 +68,19 @@ def translate_document(
         # so we can wrap the translation back in parentheses if needed.
         normalised_texts, stage_flags = _normalise_stage_directions(body_texts)
 
-        # Send directly to the model — no pre-translation token/tag wrapping.
-        # Every format tried (__DNT__, |N|, §N§, <dnt>) was corrupted or
-        # dropped by the model when called without IndicTransToolkit.
-        # Speaker labels are already extracted above; glossary overrides fire
-        # below on whatever the model outputs.
+        # Protect do-not-translate terms with bracket-free sentinels
+        # (ZZID{n}ZZ). Angle-bracket formats like <dnt>...</dnt> and <IDn>
+        # get garbled by the model — see scripts/spike_dnt.py for evidence.
+        # All-alphabetic sentinels are passed through verbatim.
+        protected_texts, replacements = protect_terms(
+            normalised_texts, glossary.do_not_translate
+        )
         translated_batch = translator.translate_batch(
-            normalised_texts,
+            protected_texts,
             source_lang=settings.source_lang,
             target_lang=settings.target_lang,
         )
+        translated_batch = restore_terms(translated_batch, replacements)
         translated_batch = apply_glossary_overrides(translated_batch, glossary.glossary_map)
 
         # Re-wrap stage-direction translations in parentheses when the model

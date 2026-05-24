@@ -44,6 +44,11 @@ from subtitle_translator.pipeline import TranslationSettings, translate_document
 from subtitle_translator.speaker_detection import detect_speaker_names
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
 
+# Lazy import — auto_dnt pulls spaCy which is heavy. We import on demand.
+def _load_auto_dnt():
+    from subtitle_translator.auto_dnt import detect_preserve_spans
+    return detect_preserve_spans
+
 SUBTITLE_FILTER = "Subtitle files (*.srt *.vtt);;SRT (*.srt);;WebVTT (*.vtt);;All files (*)"
 
 
@@ -56,6 +61,7 @@ def _format_eta(seconds: float) -> str:
 
 class TranslateWorker(QObject):
     progress = Signal(float, str)
+    model_loaded = Signal()   # fires once the model is in memory, before translation
     finished = Signal(str)
     failed = Signal(str)
 
@@ -78,6 +84,7 @@ class TranslateWorker(QObject):
     def run(self) -> None:
         try:
             translator = build_translator(self._backend, model_path=self._model_path)
+            self.model_loaded.emit()
             translated = translate_document(
                 document=self._document,
                 translator=translator,
@@ -244,9 +251,27 @@ class MainWindow(QMainWindow):
         self._file_label.setText(f"{path.name}  ·  {len(document.cues)} cues")
         self._original_view.setPlainText(serialize_subtitle(document))
 
+        # Two-pass detection: speaker labels (regex, cheap) + linguistic
+        # detection (spaCy NER + POS + wordfreq). The latter is slow on first
+        # use because spaCy lazy-loads its model, so we keep its failures
+        # non-fatal — auto-detection is best-effort, not load-bearing.
         detected_names = detect_speaker_names(document)
-        if detected_names:
-            self._merge_detected_names(detected_names)
+        auto_terms: list[str] = []
+        try:
+            detect_preserve_spans = _load_auto_dnt()
+            auto_terms = detect_preserve_spans(document)
+        except Exception as exc:  # noqa: BLE001 — surface but don't break
+            self.statusBar().showMessage(
+                f"Auto-detection unavailable: {exc}", 6000
+            )
+
+        all_detected = list(dict.fromkeys([*detected_names, *auto_terms]))
+        if all_detected:
+            self._merge_detected_names(
+                all_detected,
+                speaker_count=len(detected_names),
+                auto_count=len(auto_terms),
+            )
 
         if document.warnings:
             self.statusBar().showMessage(
@@ -288,7 +313,12 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "Write error", str(exc))
 
-    def _merge_detected_names(self, names: list[str]) -> None:
+    def _merge_detected_names(
+        self,
+        names: list[str],
+        speaker_count: int = 0,
+        auto_count: int = 0,
+    ) -> None:
         try:
             existing = json.loads(self._glossary_edit.toPlainText())
         except Exception:
@@ -303,9 +333,15 @@ class MainWindow(QMainWindow):
         existing["do_not_translate"] = dnt
         self._glossary_edit.setPlainText(json.dumps(existing, ensure_ascii=False, indent=2))
         if added:
+            if speaker_count and auto_count:
+                breakdown = f"{speaker_count} speaker label(s) + {auto_count} name/foreign-word(s)"
+            elif speaker_count:
+                breakdown = f"{speaker_count} speaker label(s)"
+            else:
+                breakdown = f"{auto_count} name/foreign-word(s)"
+            preview = ", ".join(added[:5]) + (" …" if len(added) > 5 else "")
             self.statusBar().showMessage(
-                f"Auto-detected {len(added)} speaker name(s): {', '.join(added[:5])}"
-                + (" …" if len(added) > 5 else ""),
+                f"Auto-detected {len(added)} term(s) — {breakdown}: {preview}",
                 8000,
             )
 
@@ -331,9 +367,9 @@ class MainWindow(QMainWindow):
 
         self._translate_btn.setEnabled(False)
         self._save_btn.setEnabled(False)
-        self._progress.setValue(0)
-        self._translate_start_time = time.monotonic()
-        self.statusBar().showMessage("Translating…")
+        self._progress.setRange(0, 0)   # indeterminate while model loads
+        self._translate_start_time = None
+        self.statusBar().showMessage("Loading model…")
 
         self._thread = QThread()
         self._worker = TranslateWorker(
@@ -345,6 +381,7 @@ class MainWindow(QMainWindow):
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.model_loaded.connect(self._on_model_loaded)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_translate_finished)
         self._worker.failed.connect(self._on_translate_failed)
@@ -353,6 +390,13 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    @Slot()
+    def _on_model_loaded(self) -> None:
+        self._progress.setRange(0, 100)  # switch to determinate for real progress
+        self._progress.setValue(0)
+        self._translate_start_time = time.monotonic()
+        self.statusBar().showMessage("Translating…")
 
     @Slot(float, str)
     def _on_progress(self, value: float, message: str) -> None:
@@ -377,6 +421,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_translate_failed(self, message: str) -> None:
         self._translate_btn.setEnabled(True)
+        self._progress.setRange(0, 100)
         self._progress.setValue(0)
         self._translate_start_time = None
         self.statusBar().showMessage("Translation failed.", 5000)
