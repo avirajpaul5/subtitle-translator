@@ -55,8 +55,25 @@ A desktop-style local web app for translating English subtitle files (`.srt` / `
 
 ## Setup
 
+**Requires Python 3.10 or newer.** The macOS system Python (`/usr/bin/python3`,
+currently 3.9) is too old — PyTorch no longer publishes arm64 wheels for 3.9,
+so pip silently falls back to the x86_64 build and crashes at import on Apple
+Silicon with `incompatible architecture (have 'x86_64', need 'arm64')`.
+
+On macOS, install Python 3.12 from <https://www.python.org/downloads/macos/>
+(the "macOS 64-bit universal2 installer"), then:
+
 ```bash
-python -m venv .venv
+/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+On Linux / other platforms with a recent Python already on `PATH`:
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
