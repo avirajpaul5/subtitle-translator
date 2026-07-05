@@ -11,10 +11,15 @@ class NLLBTranslator(BaseTranslator):
     def __init__(self, model_path: str, source_lang: str = "eng_Latn", target_lang: str = "ben_Beng") -> None:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+        self.model_path = model_path
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(model_path, local_files_only=True)
         self.source_lang = source_lang
         self.target_lang = target_lang
+
+    @property
+    def display_name(self) -> str:
+        return f"NLLB ({self.model_path})"
 
     def translate_batch(self, texts: Iterable[str], source_lang: str, target_lang: str) -> List[str]:
         tokenized = self.tokenizer(

@@ -18,7 +18,7 @@ A desktop-style app for translating English subtitle files (`.srt` / `.vtt`) to 
 - Batch translation with adjustable chunk size
 - Merges short cues for better context, then re-splits into original cue count
 - Subtitle-friendly line wrapping and max line length controls
-- ETA and progress display during translation
+- ETA and progress display during translation, including the active provider/model
 - Download translated subtitle in same format as input
 - Echo/test mode to validate parsing + writing pipeline without model inference
 - Translator abstraction with pluggable backends (`indictrans2`, `sarvam-api`, `nllb`, `echo`)
@@ -148,7 +148,7 @@ Sarvam options:
 
 - `mayura:v1` is the default because it supports colloquial modes that usually fit subtitle dialogue better.
 - `sarvam-translate:v1` is available for formal translation and supports a wider set of Indian languages.
-- **Fallback to local IndicTrans** loads the local model only if a Sarvam batch fails; when fallback is used, the output document includes a warning.
+- **Fallback to local IndicTrans** loads the local model only if a Sarvam batch fails; progress and completion messages show whether Sarvam or the fallback handled each batch, and the output document includes a warning when fallback is used.
 
 ## Glossary JSON format
 

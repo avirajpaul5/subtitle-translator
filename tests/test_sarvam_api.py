@@ -131,6 +131,7 @@ def test_factory_builds_sarvam_with_explicit_key():
     )
 
     assert isinstance(translator, SarvamApiTranslator)
+    assert translator.display_name == "Sarvam API (mayura:v1, classic-colloquial)"
 
 
 class _FailingTranslator(BaseTranslator):
@@ -155,3 +156,19 @@ def test_fallback_translator_uses_fallback_and_records_warning():
     assert translator.warnings
     assert "Sarvam API failed" in translator.warnings[0]
     assert "echo fallback" in translator.warnings[0]
+    assert translator.fallback_count == 1
+    assert translator.last_used_name == "UpperTranslator fallback"
+    assert "used UpperTranslator fallback for 1 batch" in translator.usage_summary
+
+
+def test_fallback_translator_reports_when_fallback_not_used():
+    translator = FallbackTranslator(
+        _UpperTranslator(),
+        lambda: _FailingTranslator(),
+        primary_name="Sarvam API",
+        fallback_name="echo",
+    )
+
+    assert translator.translate_batch(["hello"], "en", "bn") == ["HELLO"]
+    assert translator.fallback_count == 0
+    assert translator.usage_summary == "UpperTranslator; fallback not used"

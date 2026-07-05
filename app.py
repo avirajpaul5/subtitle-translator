@@ -159,6 +159,7 @@ if uploaded_file:
                         else None
                     ),
                 )
+                st.info(f"Translation provider: {translator.display_name}")
 
             settings = TranslationSettings(
                 source_lang=source_lang,
@@ -186,6 +187,12 @@ if uploaded_file:
 
             output_name = f"{Path(uploaded_file.name).stem}.translated{ext}"
             st.success("Translation complete.")
+            st.info(f"Provider used: {translator.usage_summary}")
+            if translated_doc.warnings:
+                st.warning(
+                    "Review notes:\n- " + "\n- ".join(translated_doc.warnings[:10])
+                    + ("\n- ..." if len(translated_doc.warnings) > 10 else "")
+                )
             st.download_button(
                 label="Download translated subtitle",
                 data=output_text.encode("utf-8"),

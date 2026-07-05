@@ -32,6 +32,7 @@ class IndicTrans2Translator(BaseTranslator):
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+        self.model_path = model_path
         self.device = device
         self.max_new_tokens = max_new_tokens
 
@@ -41,6 +42,10 @@ class IndicTrans2Translator(BaseTranslator):
         if device != "cpu":
             self.model = self.model.to(device)
         self.torch = torch
+
+    @property
+    def display_name(self) -> str:
+        return f"IndicTrans2 ({self.model_path})"
 
     def translate_batch(self, texts: Iterable[str], source_lang: str, target_lang: str) -> List[str]:
         import torch

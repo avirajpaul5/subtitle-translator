@@ -65,8 +65,8 @@ def _format_eta(seconds: float) -> str:
 
 class TranslateWorker(QObject):
     progress = Signal(float, str)
-    model_loaded = Signal()   # fires once the model is in memory, before translation
-    finished = Signal(str, list)  # serialized output, validation warnings
+    model_loaded = Signal(str)   # provider label once translator is ready
+    finished = Signal(str, list, str)  # serialized output, validation warnings, provider summary
     failed = Signal(str)
 
     def __init__(
@@ -103,7 +103,7 @@ class TranslateWorker(QObject):
                 sarvam_mode=self._sarvam_mode,
                 sarvam_fallback_backend=self._sarvam_fallback_backend,
             )
-            self.model_loaded.emit()
+            self.model_loaded.emit(translator.display_name)
             translated = translate_document(
                 document=self._document,
                 translator=translator,
@@ -111,7 +111,11 @@ class TranslateWorker(QObject):
                 glossary=self._glossary,
                 progress_cb=lambda v, m: self.progress.emit(v, m),
             )
-            self.finished.emit(serialize_subtitle(translated), list(translated.warnings))
+            self.finished.emit(
+                serialize_subtitle(translated),
+                list(translated.warnings),
+                translator.usage_summary,
+            )
         except (SubtitleParseError, TranslatorInitError) as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
@@ -457,11 +461,11 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     @Slot()
-    def _on_model_loaded(self) -> None:
+    def _on_model_loaded(self, provider: str) -> None:
         self._progress.setRange(0, 100)  # switch to determinate for real progress
         self._progress.setValue(0)
         self._translate_start_time = time.monotonic()
-        self.statusBar().showMessage("Translating…")
+        self.statusBar().showMessage(f"Translating with {provider}...")
 
     @Slot(float, str)
     def _on_progress(self, value: float, message: str) -> None:
@@ -474,7 +478,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message)
 
     @Slot(str, list)
-    def _on_translate_finished(self, output: str, warnings: list) -> None:
+    def _on_translate_finished(self, output: str, warnings: list, provider_summary: str) -> None:
         self._translated_output = output
         self._translated_view.setPlainText(output)
         self._progress.setValue(100)
@@ -485,13 +489,17 @@ class MainWindow(QMainWindow):
             preview = warnings[0]
             extra = f" (+{len(warnings) - 1} more)" if len(warnings) > 1 else ""
             self.statusBar().showMessage(
-                f"Translation complete. {len(warnings)} cue(s) flagged for review — "
+                f"Translation complete via {provider_summary}. "
+                f"{len(warnings)} cue(s) flagged for review — "
                 f"hover for details: {preview}{extra}",
                 15000,
             )
             self.statusBar().setToolTip("\n".join(warnings))
         else:
-            self.statusBar().showMessage("Translation complete. No issues flagged.", 5000)
+            self.statusBar().showMessage(
+                f"Translation complete via {provider_summary}. No issues flagged.",
+                5000,
+            )
             self.statusBar().setToolTip("")
 
     @Slot(str)

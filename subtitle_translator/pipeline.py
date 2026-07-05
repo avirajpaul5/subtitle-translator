@@ -64,7 +64,10 @@ def translate_document(
         batch_texts = [item.text for item in batch]
 
         if progress_cb:
-            progress_cb(chunk_idx / total_chunks, f"Translating {chunk_idx + 1}/{total_chunks}…")
+            progress_cb(
+                chunk_idx / total_chunks,
+                f"Translating {chunk_idx + 1}/{total_chunks} with {translator.display_name}...",
+            )
 
         # Strip speaker labels (e.g. "POIROT: ") before sending to the model.
         # The model cannot reliably preserve arbitrary token formats, so we
@@ -120,7 +123,13 @@ def translate_document(
                 translated_cues[cue_idx] = translated_cues[cue_idx].with_text(formatted)
 
         if progress_cb:
-            progress_cb((chunk_idx + 1) / total_chunks, f"Translated {chunk_idx + 1}/{total_chunks} chunks")
+            progress_cb(
+                (chunk_idx + 1) / total_chunks,
+                (
+                    f"Translated {chunk_idx + 1}/{total_chunks} chunks with "
+                    f"{translator.last_used_name}"
+                ),
+            )
 
     # Post-translation validation: flag (don't auto-fix) sentinel debris and
     # grammar patterns indicating poor translations. Surfaces in the

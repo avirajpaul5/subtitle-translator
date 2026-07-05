@@ -95,3 +95,19 @@ def test_translate_document_appends_translator_warnings():
         glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
     )
     assert "Sarvam API failed for a batch" in translated.warnings[-1]
+
+
+def test_translate_document_progress_reports_provider_used():
+    doc = _load("sample.srt")
+    messages: list[str] = []
+
+    translate_document(
+        document=doc,
+        translator=EchoTranslator(),
+        settings=TranslationSettings(chunk_size=99),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
+        progress_cb=lambda value, message: messages.append(message),
+    )
+
+    assert any("Translating 1/1 with echo" in message for message in messages)
+    assert any("Translated 1/1 chunks with echo" in message for message in messages)

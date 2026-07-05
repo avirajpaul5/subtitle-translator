@@ -94,6 +94,12 @@ class SarvamApiTranslator(BaseTranslator):
         self.max_input_chars = _MODEL_INPUT_LIMITS[model]
         self._transport = transport
 
+    @property
+    def display_name(self) -> str:
+        if self.model == "mayura:v1":
+            return f"Sarvam API ({self.model}, {self.mode})"
+        return f"Sarvam API ({self.model})"
+
     def translate_batch(self, texts: Iterable[str], source_lang: str, target_lang: str) -> List[str]:
         src_code = to_sarvam_language_code(source_lang)
         tgt_code = to_sarvam_language_code(target_lang)
