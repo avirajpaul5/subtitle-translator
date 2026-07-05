@@ -1,4 +1,4 @@
-# Subtitle Translator — Project Guide for Codex
+# IndicSub — Project Guide for Codex
 
 ## What This Project Does
 

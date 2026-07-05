@@ -10,3 +10,4 @@ pytest>=8.0.0
 spacy>=3.8
 wordfreq>=3.1
 keyring>=25.0
+certifi>=2024.2.2

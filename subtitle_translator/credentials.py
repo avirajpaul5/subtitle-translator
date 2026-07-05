@@ -4,7 +4,8 @@ import os
 
 
 SARVAM_API_KEY_ENV = "SARVAM_API_KEY"
-_KEYRING_SERVICE = "subtitle-translator"
+_KEYRING_SERVICE = "indicsub"
+_LEGACY_KEYRING_SERVICES = ("subtitle" + "-" + "translator",)
 _SARVAM_KEYRING_ACCOUNT = "sarvam-api-key"
 
 
@@ -37,13 +38,14 @@ def get_sarvam_api_key(
     except Exception:
         return None
 
-    try:
-        stored = keyring.get_password(_KEYRING_SERVICE, _SARVAM_KEYRING_ACCOUNT)
-    except Exception:
-        return None
+    for service in (_KEYRING_SERVICE, *_LEGACY_KEYRING_SERVICES):
+        try:
+            stored = keyring.get_password(service, _SARVAM_KEYRING_ACCOUNT)
+        except Exception:
+            continue
 
-    if stored and stored.strip():
-        return stored.strip()
+        if stored and stored.strip():
+            return stored.strip()
     return None
 
 

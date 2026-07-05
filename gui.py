@@ -1,4 +1,4 @@
-"""Native desktop GUI for the subtitle translator (PySide6).
+"""Native desktop GUI for IndicSub (PySide6).
 
 Run with: python gui.py
 """
@@ -44,9 +44,16 @@ from subtitle_translator.parsers import (
     parse_subtitle,
     serialize_subtitle,
 )
-from subtitle_translator.pipeline import TranslationSettings, translate_document
+from subtitle_translator.pipeline import (
+    TranslationInterruptedError,
+    TranslationSettings,
+    make_translation_checkpoint_path,
+    translate_document,
+)
 from subtitle_translator.speaker_detection import detect_speaker_names
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
+from subtitle_translator.translators.fallback import FallbackTranslationError
+from subtitle_translator.translators.sarvam_api import SarvamApiError
 
 # Lazy import — auto_dnt pulls spaCy which is heavy. We import on demand.
 def _load_auto_dnt():
@@ -67,6 +74,7 @@ class TranslateWorker(QObject):
     progress = Signal(float, str)
     model_loaded = Signal(str)   # provider label once translator is ready
     finished = Signal(str, list, str)  # serialized output, validation warnings, provider summary
+    interrupted = Signal(str, str, list)  # message, serialized partial output, warnings
     failed = Signal(str)
 
     def __init__(
@@ -78,6 +86,7 @@ class TranslateWorker(QObject):
         sarvam_model: str,
         sarvam_mode: str,
         sarvam_fallback_backend: str | None,
+        checkpoint_path: str | None,
         settings: TranslationSettings,
         glossary: GlossaryConfig,
     ) -> None:
@@ -89,6 +98,7 @@ class TranslateWorker(QObject):
         self._sarvam_model = sarvam_model
         self._sarvam_mode = sarvam_mode
         self._sarvam_fallback_backend = sarvam_fallback_backend
+        self._checkpoint_path = checkpoint_path
         self._settings = settings
         self._glossary = glossary
 
@@ -110,6 +120,7 @@ class TranslateWorker(QObject):
                 settings=self._settings,
                 glossary=self._glossary,
                 progress_cb=lambda v, m: self.progress.emit(v, m),
+                checkpoint_path=self._checkpoint_path,
             )
             self.finished.emit(
                 serialize_subtitle(translated),
@@ -118,6 +129,23 @@ class TranslateWorker(QObject):
             )
         except (SubtitleParseError, TranslatorInitError) as exc:
             self.failed.emit(str(exc))
+        except TranslationInterruptedError as exc:
+            self.interrupted.emit(
+                str(exc),
+                serialize_subtitle(exc.partial_document),
+                list(exc.partial_document.warnings),
+            )
+        except SarvamApiError as exc:
+            message = f"Sarvam API error: {exc}"
+            if self._backend == "sarvam-api" and self._sarvam_fallback_backend is None:
+                message += (
+                    "\n\nBackup fallback is off, so translation stopped. Fix the "
+                    "Sarvam key/model/language issue, or enable local IndicTrans "
+                    "backup and rerun."
+                )
+            self.failed.emit(message)
+        except FallbackTranslationError as exc:
+            self.failed.emit(str(exc))
         except Exception as exc:
             self.failed.emit(f"Unexpected error: {exc}")
 
@@ -125,7 +153,7 @@ class TranslateWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Subtitle Translator")
+        self.setWindowTitle("IndicSub")
         self.resize(1100, 780)
 
         self._document: SubtitleDocument | None = None
@@ -219,8 +247,12 @@ class MainWindow(QMainWindow):
         self._sarvam_mode_combo.addItems(["classic-colloquial", "modern-colloquial", "formal"])
         form.addRow("Sarvam mode", self._sarvam_mode_combo)
 
-        self._sarvam_fallback_check = QCheckBox("Fallback to local IndicTrans on Sarvam errors")
-        self._sarvam_fallback_check.setChecked(True)
+        self._sarvam_fallback_check = QCheckBox("Use local IndicTrans backup if Sarvam fails")
+        self._sarvam_fallback_check.setChecked(False)
+        self._sarvam_fallback_check.setToolTip(
+            "Leave off to stop and show the Sarvam error. Enable only when you "
+            "want a backup output; fallback usage is flagged in the result."
+        )
         form.addRow(self._sarvam_fallback_check)
 
         self._source_combo = QComboBox()
@@ -231,7 +263,7 @@ class MainWindow(QMainWindow):
         form.addRow("Target language", self._target_combo)
 
         self._chunk_size_spin = self._spin(1, 64, 12)
-        self._merge_min_spin = self._spin(0, 200, 0)
+        self._merge_min_spin = self._spin(0, 200, 60)
         self._max_line_spin = self._spin(20, 80, 42)
         self._max_lines_spin = self._spin(1, 4, 2)
         form.addRow("Batch chunk size", self._chunk_size_spin)
@@ -421,6 +453,22 @@ class MainWindow(QMainWindow):
             if backend == "sarvam-api" and self._sarvam_fallback_check.isChecked()
             else None
         )
+        checkpoint_path = None
+        if self._source_path is not None:
+            try:
+                checkpoint_path = str(
+                    make_translation_checkpoint_path(
+                        self._source_path.name,
+                        self._source_path.read_bytes(),
+                    )
+                )
+            except OSError:
+                checkpoint_path = str(
+                    make_translation_checkpoint_path(
+                        self._source_path.name,
+                        serialize_subtitle(self._document).encode("utf-8"),
+                    )
+                )
         settings = TranslationSettings(
             source_lang=self._source_combo.currentText(),
             target_lang=self._target_combo.currentText(),
@@ -445,6 +493,7 @@ class MainWindow(QMainWindow):
             sarvam_model=self._sarvam_model_combo.currentText(),
             sarvam_mode=self._sarvam_mode_combo.currentText(),
             sarvam_fallback_backend=sarvam_fallback_backend,
+            checkpoint_path=checkpoint_path,
             settings=settings,
             glossary=glossary,
         )
@@ -453,8 +502,10 @@ class MainWindow(QMainWindow):
         self._worker.model_loaded.connect(self._on_model_loaded)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_translate_finished)
+        self._worker.interrupted.connect(self._on_translate_interrupted)
         self._worker.failed.connect(self._on_translate_failed)
         self._worker.finished.connect(self._thread.quit)
+        self._worker.interrupted.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
@@ -477,7 +528,7 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(message)
 
-    @Slot(str, list)
+    @Slot(str, list, str)
     def _on_translate_finished(self, output: str, warnings: list, provider_summary: str) -> None:
         self._translated_output = output
         self._translated_view.setPlainText(output)
@@ -495,12 +546,45 @@ class MainWindow(QMainWindow):
                 15000,
             )
             self.statusBar().setToolTip("\n".join(warnings))
+            if any("FALLBACK USED" in warning for warning in warnings):
+                QMessageBox.warning(
+                    self,
+                    "Fallback used",
+                    "Sarvam failed for at least one batch, so local IndicTrans "
+                    "handled fallback output. Review the warning details before "
+                    "trusting or saving the file.",
+                )
         else:
             self.statusBar().showMessage(
                 f"Translation complete via {provider_summary}. No issues flagged.",
                 5000,
             )
             self.statusBar().setToolTip("")
+
+    @Slot(str, str, list)
+    def _on_translate_interrupted(
+        self,
+        message: str,
+        partial_output: str,
+        warnings: list,
+    ) -> None:
+        self._translated_output = partial_output
+        self._translated_view.setPlainText(partial_output)
+        self._progress.setRange(0, 100)
+        self._save_btn.setEnabled(bool(partial_output))
+        self._translate_btn.setEnabled(True)
+        self._translate_start_time = None
+        self.statusBar().showMessage(
+            "Translation interrupted. Progress checkpoint saved; rerun to resume.",
+            15000,
+        )
+        self.statusBar().setToolTip("\n".join([message, *[str(w) for w in warnings]]))
+        QMessageBox.warning(
+            self,
+            "Translation interrupted",
+            f"{message}\n\nPartial output is shown and can be saved. "
+            "Rerun with the same file, settings, glossary, and provider to resume.",
+        )
 
     @Slot(str)
     def _on_translate_failed(self, message: str) -> None:

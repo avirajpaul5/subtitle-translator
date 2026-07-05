@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import io
+import ssl
+import urllib.error
+from email.message import Message
+
 import pytest
 
 from subtitle_translator.credentials import get_sarvam_api_key
 from subtitle_translator.translators.base import BaseTranslator
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
-from subtitle_translator.translators.fallback import FallbackTranslator
+from subtitle_translator.translators.fallback import FallbackTranslationError, FallbackTranslator
 from subtitle_translator.translators.sarvam_api import (
     SarvamApiError,
     SarvamApiTranslator,
+    SarvamRateLimitError,
     to_sarvam_language_code,
 )
 
@@ -27,7 +33,7 @@ def test_sarvam_translator_sends_expected_payload():
 
     def transport(payload: dict) -> dict:
         payloads.append(payload)
-        return {"translated_text": f"bn:{payload['input']}"}
+        return {"translated_text": f"bn:{payload['input']}", "request_id": "req-1"}
 
     translator = SarvamApiTranslator(
         api_key="test-key",
@@ -50,6 +56,14 @@ def test_sarvam_translator_sends_expected_payload():
             "mode": "classic-colloquial",
         }
     ]
+    assert translator.attempted_request_count == 1
+    assert translator.successful_request_count == 1
+    assert translator.attempted_input_chars == len("Hello there")
+    assert translator.successful_input_chars == len("Hello there")
+    assert translator.request_ids == ["req-1"]
+    assert "1 successful/1 attempted" in translator.usage_summary
+    assert "input chars" in translator.usage_summary
+    assert "req-1" in translator.usage_summary
 
 
 def test_sarvam_translate_model_forces_formal_and_omits_mode_payload():
@@ -101,6 +115,91 @@ def test_sarvam_translator_rejects_missing_translated_text():
 
     with pytest.raises(SarvamApiError, match="translated_text"):
         translator.translate_batch(["Hello"], "en", "bn")
+    assert translator.attempted_request_count == 1
+    assert translator.successful_request_count == 0
+    assert translator.attempted_input_chars == len("Hello")
+
+
+def test_sarvam_translator_passes_ssl_context_to_urlopen(monkeypatch):
+    seen: dict[str, object] = {}
+    ssl_context = ssl.create_default_context()
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"translated_text": "translated", "request_id": "req-ssl"}'
+
+    def fake_urlopen(request, *, timeout, context):
+        seen["request"] = request
+        seen["timeout"] = timeout
+        seen["context"] = context
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    translator = SarvamApiTranslator(
+        api_key="test-key",
+        max_workers=1,
+        ssl_context=ssl_context,
+    )
+
+    assert translator.translate_batch(["Hello"], "en", "bn") == ["translated"]
+    assert seen["context"] is ssl_context
+    assert translator.request_ids == ["req-ssl"]
+
+
+def test_sarvam_certificate_error_is_actionable(monkeypatch):
+    def fake_urlopen(request, *, timeout, context):
+        raise urllib.error.URLError(
+            ssl.SSLCertVerificationError("certificate verify failed")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    translator = SarvamApiTranslator(
+        api_key="test-key",
+        retries=0,
+        max_workers=1,
+    )
+
+    with pytest.raises(SarvamApiError, match="Could not validate Sarvam API TLS certificate"):
+        translator.translate_batch(["Hello"], "en", "bn")
+
+    assert translator.attempted_request_count == 1
+    assert translator.successful_request_count == 0
+
+
+def test_sarvam_rate_limit_error_is_actionable(monkeypatch):
+    headers = Message()
+    headers["Retry-After"] = "12"
+
+    def fake_urlopen(request, *, timeout, context):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            headers,
+            io.BytesIO(
+                b'{"error":{"code":"rate_limit_exceeded_error","message":"Rate limit exceeded"}}'
+            ),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    translator = SarvamApiTranslator(
+        api_key="test-key",
+        retries=0,
+        max_workers=1,
+        min_request_interval_seconds=0,
+    )
+
+    with pytest.raises(SarvamRateLimitError, match="Retry after about 12 seconds"):
+        translator.translate_batch(["Hello"], "en", "bn")
+
+    assert translator.attempted_request_count == 1
+    assert translator.successful_request_count == 0
 
 
 def test_get_sarvam_api_key_prefers_explicit_then_env(monkeypatch):
@@ -154,6 +253,7 @@ def test_fallback_translator_uses_fallback_and_records_warning():
 
     assert translator.translate_batch(["hello"], "en", "bn") == ["HELLO"]
     assert translator.warnings
+    assert "FALLBACK USED" in translator.warnings[0]
     assert "Sarvam API failed" in translator.warnings[0]
     assert "echo fallback" in translator.warnings[0]
     assert translator.fallback_count == 1
@@ -172,3 +272,43 @@ def test_fallback_translator_reports_when_fallback_not_used():
     assert translator.translate_batch(["hello"], "en", "bn") == ["HELLO"]
     assert translator.fallback_count == 0
     assert translator.usage_summary == "UpperTranslator; fallback not used"
+
+
+def test_fallback_translator_reports_primary_usage_in_warning():
+    class _SarvamLikeFailure(BaseTranslator):
+        attempted_request_count = 1
+        successful_request_count = 0
+
+        @property
+        def display_name(self) -> str:
+            return "Sarvam API (mayura:v1)"
+
+        @property
+        def usage_summary(self) -> str:
+            return "Sarvam API (mayura:v1); Sarvam API responses: 0 successful/1 attempted"
+
+        def translate_batch(self, texts, source_lang: str, target_lang: str):
+            raise RuntimeError("HTTP 403")
+
+    translator = FallbackTranslator(
+        _SarvamLikeFailure(),
+        lambda: _UpperTranslator(),
+        primary_name="Sarvam API",
+        fallback_name="indictrans2",
+    )
+
+    assert translator.translate_batch(["hello"], "en", "bn") == ["HELLO"]
+    assert "0 successful/1 attempted" in translator.warnings[0]
+    assert "0 successful/1 attempted" in translator.usage_summary
+
+
+def test_fallback_translator_combines_primary_and_fallback_failures():
+    translator = FallbackTranslator(
+        _FailingTranslator(),
+        lambda: _FailingTranslator(),
+        primary_name="Sarvam API",
+        fallback_name="indictrans2",
+    )
+
+    with pytest.raises(FallbackTranslationError, match="fallback also failed"):
+        translator.translate_batch(["hello"], "en", "bn")

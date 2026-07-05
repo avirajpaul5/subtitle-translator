@@ -1,6 +1,6 @@
-# Subtitle Translator
+# IndicSub
 
-A desktop-style app for translating English subtitle files (`.srt` / `.vtt`) to Indian languages while preserving timestamps and output format. It defaults to local offline models, with an optional Sarvam API backend for users who provide their own API key.
+IndicSub is a desktop-style app for translating English subtitle files (`.srt` / `.vtt`) to Indian languages while preserving timestamps and output format. It defaults to local offline models, with an optional Sarvam API backend for users who provide their own API key.
 
 ## Features
 
@@ -13,12 +13,13 @@ A desktop-style app for translating English subtitle files (`.srt` / `.vtt`) to 
 - **Stage direction normalization**: `(BELL TOLLING)` is lowercased before translation so the model translates semantically rather than transliterating
 - **Glossary protection via sentinels**: protected terms are hidden behind model-resistant placeholders during inference and restored after translation
 - **Post-translation glossary overrides**: case-insensitive regex replacements applied after translation for reliable term substitution
-- Optional Sarvam API backend with password entry, environment/keychain lookup, model/mode selection, retries, and local fallback
+- Optional Sarvam API backend with password entry, environment/keychain lookup, model/mode selection, retries, request/input-size reporting, rate-limit backoff, resumable checkpoints, and opt-in local fallback
 - Glossary JSON upload and in-UI editor
 - Batch translation with adjustable chunk size
 - Merges short cues for better context, then re-splits into original cue count
 - Subtitle-friendly line wrapping and max line length controls
 - ETA and progress display during translation, including the active provider/model
+- Resumable checkpoints for interrupted translation jobs
 - Download translated subtitle in same format as input
 - Echo/test mode to validate parsing + writing pipeline without model inference
 - Translator abstraction with pluggable backends (`indictrans2`, `sarvam-api`, `nllb`, `echo`)
@@ -148,7 +149,10 @@ Sarvam options:
 
 - `mayura:v1` is the default because it supports colloquial modes that usually fit subtitle dialogue better.
 - `sarvam-translate:v1` is available for formal translation and supports a wider set of Indian languages.
-- **Fallback to local IndicTrans** loads the local model only if a Sarvam batch fails; progress and completion messages show whether Sarvam or the fallback handled each batch, and the output document includes a warning when fallback is used.
+- **Use local IndicTrans backup if Sarvam fails** is off by default. Leave it off when you want Sarvam errors to stop the job so you can fix the key, model, language, or account issue. Enable it only when you explicitly want backup output.
+- When fallback is enabled and used, the output document includes a `FALLBACK USED` warning. Completion messages also report Sarvam API attempts, successful responses, and the last Sarvam `request_id` when available.
+- Sarvam requests are sent one at a time with a short delay and longer retry backoff on HTTP 429 rate limits. If a job is interrupted, rerun with the same file, settings, glossary, and provider to resume from `.translation-checkpoints/` instead of resending completed chunks.
+- The pipeline reduces Sarvam input size by removing outer subtitle markup from model inputs, skipping model calls for protected-only cues, de-duplicating repeated payloads within a run, and reporting successful/sent input characters in the provider summary.
 
 ## Glossary JSON format
 

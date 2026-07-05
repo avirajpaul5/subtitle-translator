@@ -17,8 +17,15 @@ from subtitle_translator.parsers import (
     parse_subtitle,
     serialize_subtitle,
 )
-from subtitle_translator.pipeline import TranslationSettings, translate_document
+from subtitle_translator.pipeline import (
+    TranslationInterruptedError,
+    TranslationSettings,
+    make_translation_checkpoint_path,
+    translate_document,
+)
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
+from subtitle_translator.translators.fallback import FallbackTranslationError
+from subtitle_translator.translators.sarvam_api import SarvamApiError
 
 
 def _init_state() -> None:
@@ -28,10 +35,14 @@ def _init_state() -> None:
         st.session_state.last_file_name = ""
 
 
-st.set_page_config(page_title="Subtitle Translator", layout="wide")
+def _fallback_was_used(translator) -> bool:
+    return int(getattr(translator, "fallback_count", 0) or 0) > 0
+
+
+st.set_page_config(page_title="IndicSub", layout="wide")
 _init_state()
 
-st.title("📝 Subtitle Translator")
+st.title("📝 IndicSub")
 st.caption("Translate .srt/.vtt English subtitles to Bengali using local models or Sarvam API.")
 
 with st.sidebar:
@@ -46,7 +57,7 @@ with st.sidebar:
     sarvam_api_key = ""
     sarvam_model = "mayura:v1"
     sarvam_mode = "classic-colloquial"
-    sarvam_fallback_enabled = True
+    sarvam_fallback_enabled = False
     sarvam_save_key = False
     if backend == "sarvam-api":
         st.subheader("Sarvam API")
@@ -72,10 +83,18 @@ with st.sidebar:
             help="Sarvam Translate always uses formal mode.",
         )
         sarvam_fallback_enabled = st.checkbox(
-            "Fallback to local IndicTrans on Sarvam errors",
-            value=True,
-            help="Fallback is loaded only if the Sarvam request fails.",
+            "Use local IndicTrans backup if Sarvam fails",
+            value=False,
+            help=(
+                "Leave off to stop and show the Sarvam error. Enable only when "
+                "you want a backup output; fallback usage is flagged in the result."
+            ),
         )
+        if sarvam_fallback_enabled:
+            st.warning(
+                "Backup fallback is ON. If Sarvam fails, the output may come from "
+                "local IndicTrans and will be flagged for review."
+            )
 
     source_lang = st.selectbox("Source language", ["en", "hi", "bn"], index=0)
     target_lang = st.selectbox("Target language", ["bn", "hi", "en"], index=0)
@@ -171,6 +190,10 @@ if uploaded_file:
             )
 
             progress = st.progress(0.0, text="Starting...")
+            checkpoint_path = make_translation_checkpoint_path(
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+            )
 
             def on_progress(value: float, message: str) -> None:
                 progress.progress(value, text=message)
@@ -181,6 +204,7 @@ if uploaded_file:
                 settings=settings,
                 glossary=glossary_cfg,
                 progress_cb=on_progress,
+                checkpoint_path=checkpoint_path,
             )
             output_text = serialize_subtitle(translated_doc)
             st.session_state.translated_text = "\n\n".join([cue.text for cue in translated_doc.cues[:6]])
@@ -188,6 +212,11 @@ if uploaded_file:
             output_name = f"{Path(uploaded_file.name).stem}.translated{ext}"
             st.success("Translation complete.")
             st.info(f"Provider used: {translator.usage_summary}")
+            if _fallback_was_used(translator):
+                st.warning(
+                    "Fallback was used. This output was not fully produced by Sarvam; "
+                    "review the notes below before trusting the file."
+                )
             if translated_doc.warnings:
                 st.warning(
                     "Review notes:\n- " + "\n- ".join(translated_doc.warnings[:10])
@@ -204,6 +233,29 @@ if uploaded_file:
         st.error(f"Parsing error: {exc}")
     except TranslatorInitError as exc:
         st.error(f"Translator initialization error: {exc}")
+    except TranslationInterruptedError as exc:
+        partial_text = serialize_subtitle(exc.partial_document)
+        st.session_state.translated_text = "\n\n".join(
+            [cue.text for cue in exc.partial_document.cues[:6]]
+        )
+        st.error(f"Translation interrupted: {exc}")
+        if exc.checkpoint_path is not None:
+            st.info(f"Progress checkpoint saved at: {exc.checkpoint_path}")
+            st.info("Rerun with the same file, settings, glossary, and provider to resume.")
+        st.download_button(
+            label="Download partial translated subtitle",
+            data=partial_text.encode("utf-8"),
+            file_name=f"{Path(uploaded_file.name).stem}.partial{ext}",
+            mime="text/plain",
+        )
+    except SarvamApiError as exc:
+        st.error(f"Sarvam API error: {exc}")
+        st.info(
+            "Backup fallback is off, so translation stopped. Fix the Sarvam key/model/"
+            "language issue, or enable the local IndicTrans backup and rerun."
+        )
+    except FallbackTranslationError as exc:
+        st.error(f"Translation failed: {exc}")
     except Exception as exc:
         st.error(f"Unexpected error: {exc}")
 else:
