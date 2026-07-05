@@ -5,6 +5,10 @@ from pathlib import Path
 
 import streamlit as st
 
+from subtitle_translator.credentials import (
+    CredentialStorageError,
+    save_sarvam_api_key,
+)
 from subtitle_translator.defaults import DEFAULT_GLOSSARY
 from subtitle_translator.glossary import GlossaryConfig, load_glossary_json
 from subtitle_translator.parsers import (
@@ -24,20 +28,55 @@ def _init_state() -> None:
         st.session_state.last_file_name = ""
 
 
-st.set_page_config(page_title="Local Subtitle Translator", layout="wide")
+st.set_page_config(page_title="Subtitle Translator", layout="wide")
 _init_state()
 
-st.title("📝 Local Offline Subtitle Translator")
-st.caption("Translate .srt/.vtt English subtitles to Bengali using local models.")
+st.title("📝 Subtitle Translator")
+st.caption("Translate .srt/.vtt English subtitles to Bengali using local models or Sarvam API.")
 
 with st.sidebar:
     st.header("Settings")
-    backend = st.selectbox("Backend", ["indictrans2", "echo", "nllb"], index=0)
+    backend = st.selectbox("Backend", ["indictrans2", "sarvam-api", "echo", "nllb"], index=0)
     model_path = st.text_input(
         "Local model path",
         value="./models/indictrans2-en-indic",
-        help="Path to local model directory. No cloud inference calls are used.",
+        help="Path to local model directory. Used by local backends and optional Sarvam fallback.",
     )
+
+    sarvam_api_key = ""
+    sarvam_model = "mayura:v1"
+    sarvam_mode = "classic-colloquial"
+    sarvam_fallback_enabled = True
+    sarvam_save_key = False
+    if backend == "sarvam-api":
+        st.subheader("Sarvam API")
+        sarvam_api_key = st.text_input(
+            "Sarvam API key",
+            value="",
+            type="password",
+            help="Leave blank to use SARVAM_API_KEY or a key saved in the OS keychain.",
+        )
+        sarvam_save_key = st.checkbox("Save key in OS keychain", value=False)
+        sarvam_model = st.selectbox(
+            "Sarvam model",
+            ["mayura:v1", "sarvam-translate:v1"],
+            index=0,
+            help="Mayura supports colloquial modes; Sarvam Translate supports formal translation.",
+        )
+        mode_options = ["classic-colloquial", "modern-colloquial", "formal"]
+        sarvam_mode = st.selectbox(
+            "Sarvam mode",
+            mode_options,
+            index=0,
+            disabled=sarvam_model == "sarvam-translate:v1",
+            help="Sarvam Translate always uses formal mode.",
+        )
+        sarvam_fallback_enabled = st.checkbox(
+            "Fallback to local IndicTrans on Sarvam errors",
+            value=True,
+            help="Fallback is loaded only if the Sarvam request fails.",
+        )
+
     source_lang = st.selectbox("Source language", ["en", "hi", "bn"], index=0)
     target_lang = st.selectbox("Target language", ["bn", "hi", "en"], index=0)
 
@@ -102,7 +141,24 @@ if uploaded_file:
 
             with st.spinner("Initializing translator..."):
                 selected_backend = "echo" if echo_mode else backend
-                translator = build_translator(selected_backend, model_path=model_path)
+                if selected_backend == "sarvam-api" and sarvam_save_key and sarvam_api_key:
+                    try:
+                        save_sarvam_api_key(sarvam_api_key)
+                    except CredentialStorageError as exc:
+                        st.warning(str(exc))
+
+                translator = build_translator(
+                    selected_backend,
+                    model_path=model_path,
+                    sarvam_api_key=sarvam_api_key,
+                    sarvam_model=sarvam_model,
+                    sarvam_mode=sarvam_mode,
+                    sarvam_fallback_backend=(
+                        "indictrans2"
+                        if selected_backend == "sarvam-api" and sarvam_fallback_enabled
+                        else None
+                    ),
+                )
 
             settings = TranslationSettings(
                 source_lang=source_lang,

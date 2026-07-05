@@ -75,6 +75,21 @@ def main() -> int:
         local_dir_use_symlinks=False,
     )
 
+    # Also fetch the spaCy NER model used for auto-detection of names &
+    # foreign words. Small (~13 MB), idempotent, no-op if already present.
+    print()
+    print("Ensuring spaCy 'en_core_web_sm' is installed (used for auto-detection)…")
+    try:
+        import spacy
+        spacy.load("en_core_web_sm")
+        print("  already installed.")
+    except (ImportError, OSError):
+        import subprocess
+        subprocess.run(
+            [sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
+            check=False,
+        )
+
     print()
     print(f"Done. In the GUI, set:")
     print(f"  Backend    = {spec['backend']}")

@@ -5,6 +5,7 @@ from pathlib import Path
 from subtitle_translator.glossary import GlossaryConfig
 from subtitle_translator.parsers import parse_subtitle
 from subtitle_translator.pipeline import TranslationSettings, translate_document
+from subtitle_translator.translators.base import BaseTranslator
 from subtitle_translator.translators.echo import EchoTranslator
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -76,3 +77,21 @@ def test_translate_document_vtt_roundtrip_structure():
     assert len(translated.cues) == len(doc.cues)
     assert translated.header_lines == doc.header_lines
     assert translated.cues[1].identifier == "intro"
+
+
+class _WarningTranslator(BaseTranslator):
+    warnings = ["Sarvam API failed for a batch; used indictrans2 fallback."]
+
+    def translate_batch(self, texts, source_lang: str, target_lang: str):
+        return list(texts)
+
+
+def test_translate_document_appends_translator_warnings():
+    doc = _load("sample.srt")
+    translated = translate_document(
+        document=doc,
+        translator=_WarningTranslator(),
+        settings=TranslationSettings(),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
+    )
+    assert "Sarvam API failed for a batch" in translated.warnings[-1]
