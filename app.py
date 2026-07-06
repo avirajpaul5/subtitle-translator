@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -39,6 +40,78 @@ def _fallback_was_used(translator) -> bool:
     return int(getattr(translator, "fallback_count", 0) or 0) > 0
 
 
+HELP_TEXT = {
+    "backend": (
+        "Choose the translation engine. IndicTrans2 is offline and private, Sarvam API can "
+        "be faster and more natural with a valid key, echo is for testing, and NLLB is an "
+        "alternative local backend."
+    ),
+    "model_path": (
+        "Directory containing local model weights. A wrong path stops local translation; "
+        "larger IndicTrans models usually improve quality but load more slowly."
+    ),
+    "sarvam_api_key": (
+        "Optional hosted translation key. Leave blank to use SARVAM_API_KEY or a saved "
+        "keychain value. Keys entered here are only used for the current run unless saved."
+    ),
+    "sarvam_save_key": (
+        "Save the Sarvam key to the OS keychain so you do not have to paste it again. "
+        "Leave off on shared machines."
+    ),
+    "sarvam_model": (
+        "Mayura is tuned for colloquial dialogue and usually fits subtitles better. "
+        "Sarvam Translate is more formal and may be better for literal/documentary lines."
+    ),
+    "sarvam_mode": (
+        "Controls tone for Mayura. Classic colloquial is a safe subtitle default; modern "
+        "colloquial can feel more casual; formal may sound cleaner but less conversational."
+    ),
+    "sarvam_fallback": (
+        "When on, failed Sarvam batches fall back to local IndicTrans instead of stopping. "
+        "This can save a run, but mixed-provider output should be reviewed."
+    ),
+    "source_lang": (
+        "Language code of the input subtitle text. If this is wrong, translation quality "
+        "drops sharply because the model interprets the source incorrectly."
+    ),
+    "target_lang": (
+        "Language code for the output subtitles. Bengali is the default target for this app."
+    ),
+    "chunk_size": (
+        "Number of merged cue chunks translated per batch. Larger values can be faster, "
+        "but use more memory and make failures affect more text at once."
+    ),
+    "merge_min_chars": (
+        "Short cues below this length are merged for context before translation. Higher "
+        "values improve context but can make re-splitting less exact for rapid dialogue."
+    ),
+    "max_line_length": (
+        "Preferred characters per subtitle line. Lower values are easier to read on small "
+        "screens, but can create more line breaks."
+    ),
+    "max_lines": (
+        "Maximum lines per cue after wrapping. Two is subtitle-friendly; more lines preserve "
+        "longer text but can cover too much of the video."
+    ),
+    "echo_mode": (
+        "Runs the parsing, glossary, wrapping, and export path without model inference. "
+        "Useful for quick file-format checks before spending time on translation."
+    ),
+    "subtitle_file": (
+        "Drop or upload a .srt or .vtt file. You can now drop subtitle files anywhere on "
+        "the page, not only inside this box."
+    ),
+    "glossary_file": (
+        "Optional JSON with glossary replacements and do-not-translate terms. These merge "
+        "with the built-in defaults for the current run."
+    ),
+    "glossary_json": (
+        "Edit glossary overrides and protected terms before running. Invalid JSON will stop "
+        "translation so the app does not run with a broken glossary."
+    ),
+}
+
+
 APP_CSS = """
 <style>
 :root {
@@ -70,12 +143,90 @@ APP_CSS = """
     border-right: 1px solid var(--indicsub-border);
 }
 
-header[data-testid="stHeader"],
+header[data-testid="stHeader"] {
+    background: transparent;
+}
+
 [data-testid="stToolbar"],
 #MainMenu,
 footer {
     visibility: hidden;
     height: 0;
+}
+
+[data-testid="stSidebarCollapseButton"],
+[data-testid="collapsedControl"],
+[data-testid="stExpandSidebarButton"] {
+    align-items: center;
+    display: inline-flex !important;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+[data-testid="stSidebarHeader"] {
+    align-items: center;
+    min-height: 2.75rem;
+    visibility: visible !important;
+}
+
+[data-testid="stSidebarCollapseButton"] button,
+[data-testid="collapsedControl"] button,
+[data-testid="stExpandSidebarButton"] {
+    align-items: center !important;
+    background: var(--indicsub-card) !important;
+    border: 1px solid var(--indicsub-border) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 1px 2px rgba(24, 24, 27, 0.06);
+    color: var(--indicsub-foreground) !important;
+    cursor: pointer !important;
+    display: inline-flex !important;
+    height: 2rem !important;
+    justify-content: center !important;
+    min-height: 2rem !important;
+    padding: 0 !important;
+    width: 2rem !important;
+}
+
+[data-testid="stSidebarCollapseButton"] button:hover,
+[data-testid="collapsedControl"] button:hover,
+[data-testid="stExpandSidebarButton"]:hover {
+    background: var(--indicsub-muted) !important;
+    border-color: var(--indicsub-ring) !important;
+}
+
+[data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"],
+[data-testid="collapsedControl"] [data-testid="stIconMaterial"],
+[data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"] {
+    color: transparent !important;
+    display: inline-flex !important;
+    font-size: 0 !important;
+    height: 1rem !important;
+    justify-content: center;
+    line-height: 0 !important;
+    position: relative;
+    width: 1rem !important;
+}
+
+[data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"]::before,
+[data-testid="collapsedControl"] [data-testid="stIconMaterial"]::before,
+[data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"]::before {
+    color: var(--indicsub-foreground);
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 1.1rem;
+    font-weight: 700;
+    line-height: 1;
+    position: absolute;
+}
+
+[data-testid="stSidebarCollapseButton"] [data-testid="stIconMaterial"]::before {
+    content: "<";
+}
+
+[data-testid="collapsedControl"] [data-testid="stIconMaterial"]::before,
+[data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"]::before {
+    content: ">";
 }
 
 [data-testid="stSidebar"] h2,
@@ -181,6 +332,76 @@ label,
     font-weight: 600;
 }
 
+[data-testid="stWidgetLabel"] {
+    align-items: center !important;
+    display: inline-flex !important;
+    gap: 0.35rem !important;
+}
+
+[data-testid="stTooltipIcon"],
+[data-testid="stTooltipHoverTarget"] {
+    align-items: center !important;
+    color: var(--indicsub-muted-foreground) !important;
+    display: inline-flex !important;
+    flex: 0 0 auto;
+    justify-content: center !important;
+    line-height: 1;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+[data-testid="stTooltipIcon"] button,
+[data-testid="stTooltipHoverTarget"] button {
+    align-items: center !important;
+    background: transparent !important;
+    border: 0 !important;
+    border-radius: 999px !important;
+    box-shadow: none !important;
+    color: var(--indicsub-muted-foreground) !important;
+    cursor: help !important;
+    display: inline-flex !important;
+    height: 1rem !important;
+    justify-content: center !important;
+    margin: 0 !important;
+    min-height: 1rem !important;
+    min-width: 1rem !important;
+    padding: 0 !important;
+    width: 1rem !important;
+}
+
+[data-testid="stTooltipIcon"] button:hover,
+[data-testid="stTooltipHoverTarget"] button:hover,
+[data-testid="stTooltipIcon"] button:focus,
+[data-testid="stTooltipHoverTarget"] button:focus {
+    background: var(--indicsub-muted) !important;
+    color: var(--indicsub-foreground) !important;
+}
+
+[data-testid="stTooltipIcon"] svg,
+[data-testid="stTooltipHoverTarget"] svg {
+    color: currentColor !important;
+    fill: currentColor !important;
+    height: 0.95rem !important;
+    width: 0.95rem !important;
+}
+
+div[data-baseweb="tooltip"],
+div[data-baseweb="popover"] [role="tooltip"] {
+    background: var(--indicsub-foreground) !important;
+    border: 1px solid var(--indicsub-foreground) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 8px 24px rgba(24, 24, 27, 0.18) !important;
+    color: var(--indicsub-primary-foreground) !important;
+    font-size: 0.8rem !important;
+    line-height: 1.4 !important;
+    max-width: 19rem !important;
+}
+
+div[data-baseweb="tooltip"] *,
+div[data-baseweb="popover"] [role="tooltip"] * {
+    color: var(--indicsub-primary-foreground) !important;
+}
+
 div[data-baseweb="select"] > div,
 div[data-testid="stTextInput"] input,
 div[data-testid="stNumberInput"] input,
@@ -193,9 +414,176 @@ div[data-testid="stTextArea"] textarea {
     opacity: 1;
 }
 
+div[data-testid="stTextInput"] > div,
+div[data-testid="stTextInput"] [data-baseweb="input"] {
+    align-items: center;
+    border-color: var(--indicsub-border) !important;
+    border-radius: calc(var(--indicsub-radius) - 2px) !important;
+    background: var(--indicsub-card) !important;
+    min-height: 2.5rem;
+    overflow: hidden;
+}
+
+div[data-testid="stTextInput"] input {
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    min-height: 2.5rem;
+    outline: 0 !important;
+    padding: 0.55rem 0.75rem !important;
+}
+
+div[data-testid="stTextInput"] label button,
+div[data-testid="stTextInput"] label button:hover,
+div[data-testid="stTextInput"] label button:focus {
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    color: var(--indicsub-muted-foreground) !important;
+    min-height: auto;
+    padding: 0 !important;
+}
+
+div[data-testid="stTextInputRootElement"] [data-baseweb="base-input"] {
+    align-items: stretch;
+    background: var(--indicsub-card) !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    min-height: 2.5rem;
+}
+
+div[data-testid="stTextInputRootElement"] button,
+div[data-testid="stTextInputRootElement"] button:hover,
+div[data-testid="stTextInputRootElement"] button:focus {
+    align-items: center;
+    align-self: stretch;
+    background: var(--indicsub-card) !important;
+    border: 0 !important;
+    border-left: 1px solid var(--indicsub-border) !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    color: var(--indicsub-muted-foreground) !important;
+    cursor: pointer;
+    display: inline-flex;
+    justify-content: center;
+    margin: 0 !important;
+    min-height: 2.5rem;
+    min-width: 2.75rem;
+    padding: 0 0.8rem !important;
+}
+
+div[data-testid="stTextInputRootElement"] [data-baseweb="base-input"] > button:last-child {
+    border-radius: 0 calc(var(--indicsub-radius) - 2px) calc(var(--indicsub-radius) - 2px) 0 !important;
+}
+
+div[data-testid="stTextInputRootElement"] button::before,
+div[data-testid="stTextInputRootElement"] button::after {
+    display: none !important;
+}
+
+div[data-testid="stTextInputRootElement"] button svg {
+    color: var(--indicsub-muted-foreground) !important;
+    fill: currentColor !important;
+}
+
+div[data-testid="stTextInputRootElement"] button:hover svg {
+    color: var(--indicsub-foreground) !important;
+}
+
 div[data-baseweb="select"],
 div[data-baseweb="select"] * {
     cursor: pointer !important;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"] {
+    align-items: center;
+    cursor: pointer;
+    gap: 0.65rem;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"] > span:first-child {
+    background: var(--indicsub-card) !important;
+    border: 1px solid #d4d4d8 !important;
+    border-radius: 6px !important;
+    box-shadow: 0 1px 1px rgba(24, 24, 27, 0.04);
+    box-sizing: border-box;
+    height: 1rem !important;
+    min-height: 1rem !important;
+    min-width: 1rem !important;
+    position: relative;
+    width: 1rem !important;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"]:hover > span:first-child {
+    border-color: var(--indicsub-ring) !important;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"]:has(input:checked) > span:first-child,
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"]:has(input[aria-checked="true"]) > span:first-child {
+    background: var(--indicsub-primary) !important;
+    border-color: var(--indicsub-primary) !important;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"] > span:first-child::after {
+    border: solid var(--indicsub-primary-foreground);
+    border-width: 0 2px 2px 0;
+    content: "";
+    height: 0.5rem;
+    left: 0.3rem;
+    opacity: 0;
+    position: absolute;
+    top: 0.12rem;
+    transform: rotate(45deg);
+    width: 0.28rem;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"]:has(input:checked) > span:first-child::after,
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"]:has(input[aria-checked="true"]) > span:first-child::after {
+    opacity: 1;
+}
+
+div[data-testid="stCheckbox"] label[data-baseweb="checkbox"] input {
+    accent-color: var(--indicsub-primary);
+}
+
+div[data-testid="stSlider"] [data-baseweb="slider"] {
+    color: var(--indicsub-primary);
+}
+
+div[data-testid="stSlider"] [data-baseweb="slider"] [style*="height: 0.25rem"] {
+    background: var(--indicsub-primary) !important;
+    border-radius: 999px !important;
+    height: 0.35rem !important;
+}
+
+div[data-testid="stSlider"] [data-baseweb="slider"] > div > div {
+    background: var(--indicsub-muted) !important;
+    border-radius: 999px !important;
+}
+
+div[data-testid="stSlider"] [role="slider"] {
+    background: var(--indicsub-card) !important;
+    border: 2px solid var(--indicsub-primary) !important;
+    border-radius: 999px !important;
+    box-shadow: 0 1px 3px rgba(24, 24, 27, 0.16);
+    height: 1rem !important;
+    outline: none !important;
+    width: 1rem !important;
+}
+
+div[data-testid="stSlider"] [role="slider"]:focus {
+    box-shadow: 0 0 0 3px rgba(24, 24, 27, 0.12);
+}
+
+div[data-testid="stSlider"] [data-testid="stSliderThumbValue"] {
+    color: var(--indicsub-foreground) !important;
+}
+
+div[data-testid="stSlider"] [data-testid="stSliderTickBar"],
+div[data-testid="stSlider"] [data-baseweb="tick-bar"],
+div[data-testid="stSlider"] [data-baseweb="tickbar"] {
+    display: none !important;
+    pointer-events: none !important;
 }
 
 div[data-testid="stTextArea"] textarea {
@@ -232,11 +620,47 @@ div[data-testid="stFileUploader"] section * {
     color: var(--indicsub-muted-foreground) !important;
 }
 
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] {
+    background: var(--indicsub-primary) !important;
+    border-color: var(--indicsub-primary) !important;
+}
+
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileName"] *,
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] :is(span, p) {
+    color: var(--indicsub-primary-foreground) !important;
+    -webkit-text-fill-color: var(--indicsub-primary-foreground) !important;
+}
+
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileSize"],
+div[data-testid="stFileUploader"] [data-testid="stFileUploaderFileSize"] * {
+    color: rgba(250, 250, 250, 0.72) !important;
+    -webkit-text-fill-color: rgba(250, 250, 250, 0.72) !important;
+}
+
 div[data-testid="stFileUploader"] button,
 div[data-testid="stFileUploader"] button * {
     background: var(--indicsub-card) !important;
     color: var(--indicsub-foreground) !important;
     -webkit-text-fill-color: var(--indicsub-foreground) !important;
+}
+
+#indicsub-page-drop-overlay {
+    align-items: center;
+    backdrop-filter: blur(4px);
+    background: rgba(250, 250, 250, 0.82);
+    border: 2px dashed var(--indicsub-primary);
+    border-radius: var(--indicsub-radius);
+    color: var(--indicsub-foreground);
+    display: none;
+    font-size: 1.05rem;
+    font-weight: 700;
+    inset: 1rem;
+    justify-content: center;
+    pointer-events: none;
+    position: fixed;
+    text-align: center;
+    z-index: 999999;
 }
 
 div[data-testid="stButton"] > button,
@@ -299,6 +723,141 @@ def _inject_theme() -> None:
     st.markdown(APP_CSS, unsafe_allow_html=True)
 
 
+def _install_page_drop_target() -> None:
+    script = """
+(() => {
+    const appWindow = window;
+    const doc = appWindow.document;
+
+    if (appWindow.__indicSubPageDropTargetInstalled) {
+        return;
+    }
+    appWindow.__indicSubPageDropTargetInstalled = true;
+    doc.documentElement.setAttribute("data-indicsub-drop-installed", "true");
+
+    const subtitleExtensions = [".srt", ".vtt"];
+
+    function ensureOverlay() {
+        let overlay = doc.getElementById("indicsub-page-drop-overlay");
+        if (!overlay) {
+            overlay = doc.createElement("div");
+            overlay.id = "indicsub-page-drop-overlay";
+            overlay.textContent = "Drop subtitle file anywhere to upload";
+            doc.body.appendChild(overlay);
+        }
+        return overlay;
+    }
+
+    function isInsideNativeUploader(event) {
+        const target = event.target;
+        return Boolean(
+            target instanceof appWindow.Element
+            && target.closest('div[data-testid="stFileUploader"]')
+        );
+    }
+
+    function hasDraggedFiles(event) {
+        const items = Array.from(event.dataTransfer?.items || []);
+        return items.some((item) => item.kind === "file");
+    }
+
+    function getSubtitleInput() {
+        const uploaders = Array.from(
+            doc.querySelectorAll('div[data-testid="stFileUploader"]')
+        );
+        const subtitleUploader = uploaders.find((uploader) => {
+            let node = uploader;
+            for (let depth = 0; node && depth < 8; depth += 1) {
+                const text = node.innerText?.toLowerCase() || "";
+                if (text.includes("source subtitle")
+                    || text.includes("subtitle file")) {
+                    return true;
+                }
+                node = node.parentElement;
+            }
+            return false;
+        }) || uploaders[0];
+        return subtitleUploader?.querySelector('input[type="file"]') || null;
+    }
+
+    function subtitleFiles(fileList) {
+        return Array.from(fileList || []).filter((file) =>
+            subtitleExtensions.some((extension) =>
+                file.name.toLowerCase().endsWith(extension)
+            )
+        );
+    }
+
+    function showOverlay() {
+        ensureOverlay().style.display = "flex";
+    }
+
+    function hideOverlay() {
+        ensureOverlay().style.display = "none";
+    }
+
+    doc.addEventListener("dragenter", (event) => {
+        if (!isInsideNativeUploader(event) && hasDraggedFiles(event)) {
+            showOverlay();
+        }
+    }, true);
+
+    doc.addEventListener("dragover", (event) => {
+        if (!isInsideNativeUploader(event) && hasDraggedFiles(event)) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+            showOverlay();
+        }
+    }, true);
+
+    doc.addEventListener("dragleave", (event) => {
+        if (event.clientX <= 0 || event.clientY <= 0
+            || event.clientX >= appWindow.innerWidth
+            || event.clientY >= appWindow.innerHeight) {
+            hideOverlay();
+        }
+    }, true);
+
+    doc.addEventListener("drop", (event) => {
+        if (isInsideNativeUploader(event)) {
+            hideOverlay();
+            return;
+        }
+
+        const files = subtitleFiles(event.dataTransfer?.files);
+        if (!files.length) {
+            hideOverlay();
+            return;
+        }
+
+        const input = getSubtitleInput();
+        if (!input) {
+            hideOverlay();
+            return;
+        }
+
+        event.preventDefault();
+        const transfer = new appWindow.DataTransfer();
+        files.slice(0, 1).forEach((file) => transfer.items.add(file));
+        input.files = transfer.files;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        hideOverlay();
+    }, true);
+})();
+"""
+    encoded_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    st.html(
+        f"""
+        <script>
+            window.__indicSubPageDropTargetBootstrapSeen = true;
+            Function(atob("{encoded_script}"))();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
+
 def _section_heading(title: str, description: str | None = None) -> None:
     description_html = f"<p>{description}</p>" if description else ""
     st.markdown(
@@ -321,6 +880,7 @@ def _status_strip(*items: str) -> None:
 st.set_page_config(page_title="IndicSub", layout="wide", initial_sidebar_state="expanded")
 _init_state()
 _inject_theme()
+_install_page_drop_target()
 
 st.markdown(
     """
@@ -344,11 +904,16 @@ with st.sidebar:
     st.markdown("## Controls")
     with st.container(border=True):
         _section_heading("Provider", "Translation backend and model source.")
-        backend = st.selectbox("Backend", ["indictrans2", "sarvam-api", "echo", "nllb"], index=0)
+        backend = st.selectbox(
+            "Backend",
+            ["indictrans2", "sarvam-api", "echo", "nllb"],
+            index=0,
+            help=HELP_TEXT["backend"],
+        )
         model_path = st.text_input(
             "Local model path",
             value="./models/indictrans2-en-indic",
-            help="Path to local model directory. Used by local backends and optional Sarvam fallback.",
+            help=HELP_TEXT["model_path"],
         )
 
     sarvam_api_key = ""
@@ -363,14 +928,18 @@ with st.sidebar:
                 "Sarvam API key",
                 value="",
                 type="password",
-                help="Leave blank to use SARVAM_API_KEY or a key saved in the OS keychain.",
+                help=HELP_TEXT["sarvam_api_key"],
             )
-            sarvam_save_key = st.checkbox("Save key in OS keychain", value=False)
+            sarvam_save_key = st.checkbox(
+                "Save key in OS keychain",
+                value=False,
+                help=HELP_TEXT["sarvam_save_key"],
+            )
             sarvam_model = st.selectbox(
                 "Sarvam model",
                 ["mayura:v1", "sarvam-translate:v1"],
                 index=0,
-                help="Mayura supports colloquial modes; Sarvam Translate supports formal translation.",
+                help=HELP_TEXT["sarvam_model"],
             )
             mode_options = ["classic-colloquial", "modern-colloquial", "formal"]
             sarvam_mode = st.selectbox(
@@ -378,15 +947,12 @@ with st.sidebar:
                 mode_options,
                 index=0,
                 disabled=sarvam_model == "sarvam-translate:v1",
-                help="Sarvam Translate always uses formal mode.",
+                help=HELP_TEXT["sarvam_mode"],
             )
             sarvam_fallback_enabled = st.checkbox(
                 "Use local IndicTrans backup if Sarvam fails",
                 value=False,
-                help=(
-                    "Leave off to stop and show the Sarvam error. Enable only when "
-                    "you want a backup output; fallback usage is flagged in the result."
-                ),
+                help=HELP_TEXT["sarvam_fallback"],
             )
             if sarvam_fallback_enabled:
                 st.warning(
@@ -396,36 +962,75 @@ with st.sidebar:
 
     with st.container(border=True):
         _section_heading("Languages", "Source and target locale.")
-        source_lang = st.selectbox("Source language", ["en", "hi", "bn"], index=0)
-        target_lang = st.selectbox("Target language", ["bn", "hi", "en"], index=0)
+        source_lang = st.selectbox(
+            "Source language",
+            ["en", "hi", "bn"],
+            index=0,
+            help=HELP_TEXT["source_lang"],
+        )
+        target_lang = st.selectbox(
+            "Target language",
+            ["bn", "hi", "en"],
+            index=0,
+            help=HELP_TEXT["target_lang"],
+        )
 
     with st.container(border=True):
         _section_heading("Formatting", "Batching and subtitle line limits.")
-        chunk_size = st.slider("Batch chunk size", 1, 64, 12)
-        merge_min_chars = st.slider("Merge cues below chars", 10, 200, 60)
-        max_line_length = st.slider("Max line length", 20, 60, 42)
-        max_lines = st.slider("Max lines per cue", 1, 4, 2)
+        chunk_size = st.slider("Batch chunk size", 1, 64, 12, help=HELP_TEXT["chunk_size"])
+        merge_min_chars = st.slider(
+            "Merge cues below chars",
+            10,
+            200,
+            60,
+            help=HELP_TEXT["merge_min_chars"],
+        )
+        max_line_length = st.slider(
+            "Max line length",
+            20,
+            60,
+            42,
+            help=HELP_TEXT["max_line_length"],
+        )
+        max_lines = st.slider("Max lines per cue", 1, 4, 2, help=HELP_TEXT["max_lines"])
 
     with st.container(border=True):
         _section_heading("Run Mode")
-        echo_mode = st.checkbox("Echo/test mode (skip real translation)", value=False)
+        echo_mode = st.checkbox(
+            "Echo/test mode (skip real translation)",
+            value=False,
+            help=HELP_TEXT["echo_mode"],
+        )
 
 input_col, glossary_col = st.columns([0.9, 1.1], gap="large")
 with input_col:
     with st.container(border=True):
         _section_heading("Source Subtitle", "Upload the subtitle file to process.")
-        uploaded_file = st.file_uploader("Subtitle file", type=["srt", "vtt"])
+        uploaded_file = st.file_uploader(
+            "Subtitle file",
+            type=["srt", "vtt"],
+            help=HELP_TEXT["subtitle_file"],
+        )
 
 with glossary_col:
     with st.container(border=True):
         _section_heading("Glossary & Protected Terms", "Overrides and do-not-translate entries.")
-        uploaded_glossary = st.file_uploader("Glossary JSON", type=["json"])
+        uploaded_glossary = st.file_uploader(
+            "Glossary JSON",
+            type=["json"],
+            help=HELP_TEXT["glossary_file"],
+        )
         if uploaded_glossary:
             glossary_raw = uploaded_glossary.getvalue().decode("utf-8")
         else:
             glossary_raw = json.dumps(DEFAULT_GLOSSARY, ensure_ascii=False, indent=2)
 
-        glossary_raw = st.text_area("Glossary JSON", value=glossary_raw, height=220)
+        glossary_raw = st.text_area(
+            "Glossary JSON",
+            value=glossary_raw,
+            height=220,
+            help=HELP_TEXT["glossary_json"],
+        )
 
 if uploaded_file:
     try:
