@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -61,6 +62,204 @@ def _load_auto_dnt():
     return detect_preserve_spans
 
 SUBTITLE_FILTER = "Subtitle files (*.srt *.vtt);;SRT (*.srt);;WebVTT (*.vtt);;All files (*)"
+
+APP_STYLESHEET = """
+QWidget {
+    color: #09090b;
+    font-family: "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+
+QMainWindow,
+QWidget#AppRoot {
+    background: #fafafa;
+}
+
+QFrame#HeaderCard,
+QFrame#ActionBar {
+    background: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 10px;
+}
+
+QLabel#Eyebrow {
+    color: #71717a;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+QLabel#AppTitle {
+    color: #09090b;
+    font-size: 28px;
+    font-weight: 800;
+}
+
+QLabel#Subtitle {
+    color: #71717a;
+    font-size: 13px;
+}
+
+QLabel#StatusPill {
+    background: #f4f4f5;
+    border: 1px solid #e4e4e7;
+    border-radius: 999px;
+    color: #18181b;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 10px;
+}
+
+QGroupBox {
+    background: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 10px;
+    font-weight: 700;
+    margin-top: 18px;
+    padding: 20px 14px 14px 14px;
+}
+
+QGroupBox::title {
+    background: #ffffff;
+    color: #09090b;
+    left: 12px;
+    padding: 0 6px;
+    subcontrol-origin: margin;
+    top: 2px;
+}
+
+QLabel {
+    color: #3f3f46;
+}
+
+QLineEdit,
+QPlainTextEdit,
+QComboBox,
+QSpinBox {
+    background: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 8px;
+    color: #09090b;
+    padding: 6px 8px;
+    selection-background-color: #18181b;
+    selection-color: #fafafa;
+}
+
+QPlainTextEdit {
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 12px;
+}
+
+QLineEdit:focus,
+QPlainTextEdit:focus,
+QComboBox:focus,
+QSpinBox:focus {
+    border-color: #a1a1aa;
+}
+
+QComboBox {
+    padding-right: 24px;
+}
+
+QComboBox::drop-down,
+QSpinBox::up-button,
+QSpinBox::down-button {
+    border: 0;
+    width: 22px;
+}
+
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 8px;
+    color: #18181b;
+    font-weight: 600;
+    min-height: 26px;
+    padding: 7px 12px;
+}
+
+QPushButton:hover {
+    background: #f4f4f5;
+    border-color: #d4d4d8;
+}
+
+QPushButton:pressed {
+    background: #e4e4e7;
+}
+
+QPushButton:disabled {
+    background: #f4f4f5;
+    color: #a1a1aa;
+}
+
+QPushButton[variant="primary"] {
+    background: #18181b;
+    border-color: #18181b;
+    color: #fafafa;
+}
+
+QPushButton[variant="primary"]:hover {
+    background: #27272a;
+    border-color: #27272a;
+}
+
+QPushButton[variant="primary"]:disabled {
+    background: #a1a1aa;
+    border-color: #a1a1aa;
+    color: #fafafa;
+}
+
+QCheckBox {
+    color: #3f3f46;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    background: #ffffff;
+    border: 1px solid #d4d4d8;
+    border-radius: 4px;
+    height: 14px;
+    width: 14px;
+}
+
+QCheckBox::indicator:checked {
+    background: #18181b;
+    border-color: #18181b;
+}
+
+QProgressBar {
+    background: #f4f4f5;
+    border: 1px solid #e4e4e7;
+    border-radius: 7px;
+    color: transparent;
+    height: 13px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background: #18181b;
+    border-radius: 6px;
+}
+
+QSplitter::handle {
+    background: #e4e4e7;
+    margin: 10px 3px;
+    width: 1px;
+}
+
+QStatusBar {
+    background: #ffffff;
+    border-top: 1px solid #e4e4e7;
+    color: #71717a;
+}
+
+QToolTip {
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 6px;
+    color: #fafafa;
+    padding: 6px;
+}
+"""
 
 
 def _format_eta(seconds: float) -> str:
@@ -154,7 +353,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("IndicSub")
-        self.resize(1100, 780)
+        self.resize(1180, 820)
 
         self._document: SubtitleDocument | None = None
         self._source_path: Path | None = None
@@ -166,41 +365,101 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.statusBar().showMessage("Open a .srt or .vtt file to begin.")
 
+    @staticmethod
+    def _button(text: str, variant: str = "secondary") -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty("variant", variant)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        return button
+
+    @staticmethod
+    def _combo(items: list[str]) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(items)
+        combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
+        return combo
+
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("AppRoot")
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(18, 18, 18, 14)
+        root.setSpacing(14)
 
-        top_bar = QHBoxLayout()
-        self._open_btn = QPushButton("Open subtitle…")
-        self._open_btn.clicked.connect(self._on_open)
+        header = QFrame()
+        header.setObjectName("HeaderCard")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 16, 18, 16)
+        header_layout.setSpacing(16)
+
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(3)
+        eyebrow = QLabel("SUBTITLE TRANSLATION STUDIO")
+        eyebrow.setObjectName("Eyebrow")
+        title = QLabel("IndicSub")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel(
+            "English subtitle files to Bengali with protected terms, glossary overrides, "
+            "and resumable output."
+        )
+        subtitle.setObjectName("Subtitle")
+        subtitle.setWordWrap(True)
+        title_stack.addWidget(eyebrow)
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+
         self._file_label = QLabel("No file loaded")
-        top_bar.addWidget(self._open_btn)
-        top_bar.addWidget(self._file_label, 1)
-        root.addLayout(top_bar)
+        self._file_label.setObjectName("StatusPill")
+        self._file_label.setAlignment(Qt.AlignCenter)
+        self._open_btn = self._button("Open subtitle...")
+        self._open_btn.clicked.connect(self._on_open)
+
+        header_layout.addLayout(title_stack, 1)
+        header_layout.addWidget(self._file_label)
+        header_layout.addWidget(self._open_btn)
+        root.addWidget(header)
 
         settings_glossary_row = QHBoxLayout()
+        settings_glossary_row.setSpacing(14)
         settings_glossary_row.addWidget(self._build_settings_group(), 1)
         settings_glossary_row.addWidget(self._build_glossary_group(), 1)
         root.addLayout(settings_glossary_row)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        original_group = QGroupBox("Original Subtitle")
+        original_layout = QVBoxLayout(original_group)
+        original_layout.setContentsMargins(10, 12, 10, 10)
         self._original_view = QPlainTextEdit()
         self._original_view.setReadOnly(True)
         self._original_view.setPlaceholderText("Original subtitle content will appear here.")
+        original_layout.addWidget(self._original_view)
+
+        translated_group = QGroupBox("Translated Subtitle")
+        translated_layout = QVBoxLayout(translated_group)
+        translated_layout.setContentsMargins(10, 12, 10, 10)
         self._translated_view = QPlainTextEdit()
         self._translated_view.setReadOnly(True)
         self._translated_view.setPlaceholderText("Translated subtitle content will appear here.")
-        splitter.addWidget(self._original_view)
-        splitter.addWidget(self._translated_view)
-        splitter.setSizes([550, 550])
+        translated_layout.addWidget(self._translated_view)
+
+        splitter.addWidget(original_group)
+        splitter.addWidget(translated_group)
+        splitter.setSizes([580, 580])
         root.addWidget(splitter, 1)
 
-        action_bar = QHBoxLayout()
-        self._translate_btn = QPushButton("Translate")
+        action_shell = QFrame()
+        action_shell.setObjectName("ActionBar")
+        action_bar = QHBoxLayout(action_shell)
+        action_bar.setContentsMargins(14, 12, 14, 12)
+        action_bar.setSpacing(12)
+        self._translate_btn = self._button("Translate", "primary")
         self._translate_btn.setEnabled(False)
         self._translate_btn.clicked.connect(self._on_translate)
-        self._save_btn = QPushButton("Save translated…")
+        self._save_btn = self._button("Save translated...")
         self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._on_save)
         self._progress = QProgressBar()
@@ -208,19 +467,25 @@ class MainWindow(QMainWindow):
         action_bar.addWidget(self._translate_btn)
         action_bar.addWidget(self._progress, 1)
         action_bar.addWidget(self._save_btn)
-        root.addLayout(action_bar)
+        root.addWidget(action_shell)
 
     def _build_settings_group(self) -> QGroupBox:
         group = QGroupBox("Settings")
         form = QFormLayout(group)
+        form.setContentsMargins(12, 14, 12, 12)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        form.setHorizontalSpacing(14)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setVerticalSpacing(10)
 
-        self._backend_combo = QComboBox()
-        self._backend_combo.addItems(["indictrans2", "sarvam-api", "echo", "nllb"])
+        self._backend_combo = self._combo(["indictrans2", "sarvam-api", "echo", "nllb"])
         form.addRow("Backend", self._backend_combo)
 
         model_row = QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(8)
         self._model_path_edit = QLineEdit("./models/indictrans2-en-indic")
-        browse_btn = QPushButton("Browse")
+        browse_btn = self._button("Browse")
         browse_btn.clicked.connect(self._on_browse_model)
         model_row.addWidget(self._model_path_edit, 1)
         model_row.addWidget(browse_btn)
@@ -238,13 +503,13 @@ class MainWindow(QMainWindow):
         self._save_sarvam_key_check = QCheckBox("Save Sarvam key in OS keychain")
         form.addRow(self._save_sarvam_key_check)
 
-        self._sarvam_model_combo = QComboBox()
-        self._sarvam_model_combo.addItems(["mayura:v1", "sarvam-translate:v1"])
+        self._sarvam_model_combo = self._combo(["mayura:v1", "sarvam-translate:v1"])
         self._sarvam_model_combo.currentTextChanged.connect(self._on_sarvam_model_changed)
         form.addRow("Sarvam model", self._sarvam_model_combo)
 
-        self._sarvam_mode_combo = QComboBox()
-        self._sarvam_mode_combo.addItems(["classic-colloquial", "modern-colloquial", "formal"])
+        self._sarvam_mode_combo = self._combo(
+            ["classic-colloquial", "modern-colloquial", "formal"]
+        )
         form.addRow("Sarvam mode", self._sarvam_mode_combo)
 
         self._sarvam_fallback_check = QCheckBox("Use local IndicTrans backup if Sarvam fails")
@@ -255,10 +520,8 @@ class MainWindow(QMainWindow):
         )
         form.addRow(self._sarvam_fallback_check)
 
-        self._source_combo = QComboBox()
-        self._source_combo.addItems(["en", "hi", "bn"])
-        self._target_combo = QComboBox()
-        self._target_combo.addItems(["bn", "hi", "en"])
+        self._source_combo = self._combo(["en", "hi", "bn"])
+        self._target_combo = self._combo(["bn", "hi", "en"])
         form.addRow("Source language", self._source_combo)
         form.addRow("Target language", self._target_combo)
 
@@ -286,11 +549,15 @@ class MainWindow(QMainWindow):
     def _build_glossary_group(self) -> QGroupBox:
         group = QGroupBox("Glossary JSON")
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(12, 14, 12, 12)
+        layout.setSpacing(10)
 
         btn_row = QHBoxLayout()
-        load_btn = QPushButton("Load JSON…")
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
+        load_btn = self._button("Load JSON...")
         load_btn.clicked.connect(self._on_load_glossary)
-        save_btn = QPushButton("Save JSON…")
+        save_btn = self._button("Save JSON...")
         save_btn.clicked.connect(self._on_save_glossary)
         btn_row.addWidget(load_btn)
         btn_row.addWidget(save_btn)
@@ -333,7 +600,7 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         self._save_btn.setEnabled(False)
         self._translate_btn.setEnabled(True)
-        self._file_label.setText(f"{path.name}  ·  {len(document.cues)} cues")
+        self._file_label.setText(f"{path.name} | {len(document.cues)} cues")
         self._original_view.setPlainText(serialize_subtitle(document))
 
         # Two-pass detection: speaker labels (regex, cheap) + linguistic
@@ -615,6 +882,8 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(APP_STYLESHEET)
     window = MainWindow()
     window.show()
     return app.exec()
