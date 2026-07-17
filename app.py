@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import html
 import json
+import math
 from pathlib import Path
+from typing import Iterable
 
 import streamlit as st
 
@@ -11,6 +15,16 @@ from subtitle_translator.credentials import (
     save_sarvam_api_key,
 )
 from subtitle_translator.defaults import DEFAULT_GLOSSARY
+from subtitle_translator.document_pipeline import (
+    DocumentTranslationInterruptedError,
+    DocumentTranslationSettings,
+    translate_text_document,
+)
+from subtitle_translator.documents import (
+    DocumentParseError,
+    parse_document,
+    serialize_document,
+)
 from subtitle_translator.glossary import GlossaryConfig, load_glossary_json
 from subtitle_translator.parsers import (
     SubtitleParseError,
@@ -30,14 +44,263 @@ from subtitle_translator.translators.sarvam_api import SarvamApiError
 
 
 def _init_state() -> None:
-    if "translated_text" not in st.session_state:
-        st.session_state.translated_text = ""
-    if "last_file_name" not in st.session_state:
-        st.session_state.last_file_name = ""
+    defaults = {
+        "translated_text": "",
+        "last_file_name": "",
+        "active_job_signature": "",
+        "result_output_name": "",
+        "result_mime": "text/plain",
+        "result_provider": "",
+        "result_warnings": [],
+        "result_is_partial": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _clear_result() -> None:
+    st.session_state.translated_text = ""
+    st.session_state.result_output_name = ""
+    st.session_state.result_mime = "text/plain"
+    st.session_state.result_provider = ""
+    st.session_state.result_warnings = []
+    st.session_state.result_is_partial = False
+
+
+def _store_result(
+    output_text: str,
+    *,
+    output_name: str,
+    mime: str,
+    provider: str,
+    warnings: Iterable[str] = (),
+    partial: bool = False,
+) -> None:
+    st.session_state.translated_text = output_text
+    st.session_state.result_output_name = output_name
+    st.session_state.result_mime = mime
+    st.session_state.result_provider = provider
+    st.session_state.result_warnings = list(warnings)
+    st.session_state.result_is_partial = partial
 
 
 def _fallback_was_used(translator) -> bool:
     return int(getattr(translator, "fallback_count", 0) or 0) > 0
+
+
+LANGUAGE_OPTIONS = {
+    "en": "English · English",
+    "as": "Assamese · অসমীয়া",
+    "bn": "Bengali · বাংলা",
+    "brx": "Bodo · बर'",
+    "doi": "Dogri · डोगरी",
+    "gu": "Gujarati · ગુજરાતી",
+    "hi": "Hindi · हिन्दी",
+    "kn": "Kannada · ಕನ್ನಡ",
+    "kok": "Konkani · कोंकणी",
+    "ks": "Kashmiri · کٲشُر",
+    "mai": "Maithili · मैथिली",
+    "ml": "Malayalam · മലയാളം",
+    "mni": "Manipuri (Meitei)",
+    "mr": "Marathi · मराठी",
+    "ne": "Nepali · नेपाली",
+    "or": "Odia · ଓଡ଼ିଆ",
+    "pa": "Punjabi · ਪੰਜਾਬੀ",
+    "sa": "Sanskrit · संस्कृतम्",
+    "sat": "Santali · ᱥᱟᱱᱛᱟᱲᱤ",
+    "sd": "Sindhi · سنڌي",
+    "ta": "Tamil · தமிழ்",
+    "te": "Telugu · తెలుగు",
+    "ur": "Urdu · اردو",
+}
+
+# Mayura supports a narrower route set than Sarvam Translate. Keep these as
+# internal language codes; ``SarvamApiTranslator`` maps Odia's ``or`` to the
+# provider's ``od-IN`` code at request time.
+SARVAM_MAYURA_CODES = (
+    "en",
+    "bn",
+    "gu",
+    "hi",
+    "kn",
+    "ml",
+    "mr",
+    "or",
+    "pa",
+    "ta",
+    "te",
+)
+
+PROVIDER_OPTIONS = {
+    "indictrans2": "IndicTrans2 · local/offline",
+    "sarvam-api": "Sarvam API · hosted",
+    "nllb": "NLLB · local/offline",
+    "echo": "Echo · structure test only",
+}
+
+SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
+DOCUMENT_EXTENSIONS = {".txt", ".md"}
+
+
+def _local_model_identity(model_path: str) -> str:
+    config_path = Path(model_path).expanduser() / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return Path(model_path).name or model_path
+    if not isinstance(config, dict):
+        return Path(model_path).name or model_path
+    identity = config.get("name_or_path") or config.get("_name_or_path")
+    return str(identity) if identity else (Path(model_path).name or model_path)
+
+
+def _local_model_status(
+    model_path: str,
+    expected_backend: str,
+) -> tuple[bool, str, str]:
+    """Inspect a local checkpoint before enabling an inference action."""
+
+    path = Path(model_path).expanduser()
+    identity = path.name or model_path
+    backend_label = "IndicTrans2" if expected_backend == "indictrans2" else "NLLB"
+    if not path.is_dir():
+        return False, identity, f"Local model directory was not found: {model_path}"
+
+    config_path = path / "config.json"
+    if not config_path.is_file():
+        return (
+            False,
+            identity,
+            f"{backend_label} model is not ready: {config_path} is missing.",
+        )
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        return False, identity, f"Could not read local model config: {exc}"
+    if not isinstance(config, dict):
+        return False, identity, "Local model config.json must contain a JSON object."
+
+    configured_identity = config.get("name_or_path") or config.get("_name_or_path")
+    if configured_identity:
+        identity = str(configured_identity)
+    architectures = config.get("architectures")
+    if isinstance(architectures, list):
+        architecture_text = " ".join(str(item) for item in architectures)
+    else:
+        architecture_text = str(architectures or "")
+    evidence = " ".join(
+        (
+            identity,
+            str(config.get("model_type") or ""),
+            architecture_text,
+        )
+    ).lower()
+    expected_marker = "indictrans" if expected_backend == "indictrans2" else "nllb"
+    if expected_marker not in evidence:
+        return (
+            False,
+            identity,
+            f"Model type mismatch: {identity} is not an identifiable {backend_label} checkpoint.",
+        )
+    return True, identity, f"{backend_label} checkpoint is ready: {identity}"
+
+
+def _estimated_context_windows(
+    texts: Iterable[str],
+    *,
+    max_chars: int,
+    max_units: int,
+) -> int:
+    """Estimate packed windows without invoking a provider or altering source text."""
+
+    char_limit = max(1, int(max_chars))
+    unit_limit = max(1, int(max_units))
+    windows = 0
+    used_chars = 0
+    used_units = 0
+
+    for text in texts:
+        length = max(1, len(text.strip()))
+        piece_count = max(1, math.ceil(length / char_limit))
+        remaining = length
+        for _ in range(piece_count):
+            piece_length = min(char_limit, remaining)
+            separator_cost = 1 if used_units else 0
+            if used_units and (
+                used_units >= unit_limit
+                or used_chars + separator_cost + piece_length > char_limit
+            ):
+                windows += 1
+                used_chars = 0
+                used_units = 0
+                separator_cost = 0
+            used_chars += separator_cost + piece_length
+            used_units += 1
+            remaining = max(0, remaining - piece_length)
+
+    return windows + (1 if used_units else 0)
+
+
+def _estimated_document_windows(document, *, max_chars: int, max_blocks: int) -> int:
+    windows = 0
+    semantic_group: list[str] = []
+
+    def flush() -> None:
+        nonlocal windows
+        if semantic_group:
+            windows += _estimated_context_windows(
+                semantic_group,
+                max_chars=max_chars,
+                max_units=max_blocks,
+            )
+            semantic_group.clear()
+
+    for block in document.blocks:
+        if block.kind == "heading":
+            flush()
+        if not block.translatable:
+            flush()
+            continue
+        semantic_group.append(block.source_text)
+    flush()
+    return windows
+
+
+def _job_signature(source_bytes: bytes, settings: dict, glossary_raw: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(source_bytes)
+    digest.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
+    digest.update(glossary_raw.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _mime_type(ext: str) -> str:
+    return {
+        ".srt": "application/x-subrip",
+        ".vtt": "text/vtt",
+        ".md": "text/markdown",
+        ".txt": "text/plain",
+    }.get(ext, "text/plain")
+
+
+def _effective_plan_char_limit(
+    *,
+    backend: str,
+    sarvam_model: str,
+    sarvam_fallback_enabled: bool,
+    requested: int,
+) -> int:
+    provider_cap: int | None = None
+    if backend in {"indictrans2", "nllb"} or (
+        backend == "sarvam-api" and sarvam_fallback_enabled
+    ):
+        provider_cap = 500
+    elif backend == "sarvam-api":
+        provider_cap = 1000 if sarvam_model == "mayura:v1" else 2000
+    if provider_cap is None:
+        return requested
+    return min(requested, max(1, int(provider_cap * 0.9)))
 
 
 HELP_TEXT = {
@@ -71,19 +334,23 @@ HELP_TEXT = {
         "This can save a run, but mixed-provider output should be reviewed."
     ),
     "source_lang": (
-        "Language code of the input subtitle text. If this is wrong, translation quality "
+        "Language of the input text. If this is wrong, translation quality "
         "drops sharply because the model interprets the source incorrectly."
     ),
     "target_lang": (
-        "Language code for the output subtitles. Bengali is the default target for this app."
+        "Language for the translated output. Bengali remains the default."
     ),
     "chunk_size": (
-        "Number of merged cue chunks translated per batch. Larger values can be faster, "
+        "Number of context windows translated per pipeline batch. Larger values can be faster, "
         "but use more memory and make failures affect more text at once."
     ),
-    "merge_min_chars": (
-        "Short cues below this length are merged for context before translation. Higher "
-        "values improve context but can make re-splitting less exact for rapid dialogue."
+    "context_window_chars": (
+        "Character budget for one semantic context window. The pipeline maps every cue or "
+        "document block back exactly and safely retries individual units if alignment fails."
+    ),
+    "context_window_units": (
+        "Maximum cues or document blocks grouped into one model request. More units add context; "
+        "the character budget still prevents oversized provider requests."
     ),
     "max_line_length": (
         "Preferred characters per subtitle line. Lower values are easier to read on small "
@@ -93,13 +360,9 @@ HELP_TEXT = {
         "Maximum lines per cue after wrapping. Two is subtitle-friendly; more lines preserve "
         "longer text but can cover too much of the video."
     ),
-    "echo_mode": (
-        "Runs the parsing, glossary, wrapping, and export path without model inference. "
-        "Useful for quick file-format checks before spending time on translation."
-    ),
-    "subtitle_file": (
-        "Drop or upload a .srt or .vtt file. You can now drop subtitle files anywhere on "
-        "the page, not only inside this box."
+    "source_file": (
+        "Drop or upload a subtitle (.srt/.vtt) or text document (.txt/.md). You can drop "
+        "supported source files anywhere on the page."
     ),
     "glossary_file": (
         "Optional JSON with glossary replacements and do-not-translate terms. These merge "
@@ -735,14 +998,14 @@ def _install_page_drop_target() -> None:
     appWindow.__indicSubPageDropTargetInstalled = true;
     doc.documentElement.setAttribute("data-indicsub-drop-installed", "true");
 
-    const subtitleExtensions = [".srt", ".vtt"];
+    const sourceExtensions = [".srt", ".vtt", ".txt", ".md"];
 
     function ensureOverlay() {
         let overlay = doc.getElementById("indicsub-page-drop-overlay");
         if (!overlay) {
             overlay = doc.createElement("div");
             overlay.id = "indicsub-page-drop-overlay";
-            overlay.textContent = "Drop subtitle file anywhere to upload";
+            overlay.textContent = "Drop a subtitle or document anywhere to upload";
             doc.body.appendChild(overlay);
         }
         return overlay;
@@ -761,28 +1024,28 @@ def _install_page_drop_target() -> None:
         return items.some((item) => item.kind === "file");
     }
 
-    function getSubtitleInput() {
+    function getSourceInput() {
         const uploaders = Array.from(
             doc.querySelectorAll('div[data-testid="stFileUploader"]')
         );
-        const subtitleUploader = uploaders.find((uploader) => {
+        const sourceUploader = uploaders.find((uploader) => {
             let node = uploader;
             for (let depth = 0; node && depth < 8; depth += 1) {
                 const text = node.innerText?.toLowerCase() || "";
-                if (text.includes("source subtitle")
-                    || text.includes("subtitle file")) {
+                if (text.includes("source file")
+                    || text.includes("subtitle or document")) {
                     return true;
                 }
                 node = node.parentElement;
             }
             return false;
         }) || uploaders[0];
-        return subtitleUploader?.querySelector('input[type="file"]') || null;
+        return sourceUploader?.querySelector('input[type="file"]') || null;
     }
 
-    function subtitleFiles(fileList) {
+    function sourceFiles(fileList) {
         return Array.from(fileList || []).filter((file) =>
-            subtitleExtensions.some((extension) =>
+            sourceExtensions.some((extension) =>
                 file.name.toLowerCase().endsWith(extension)
             )
         );
@@ -824,13 +1087,13 @@ def _install_page_drop_target() -> None:
             return;
         }
 
-        const files = subtitleFiles(event.dataTransfer?.files);
+        const files = sourceFiles(event.dataTransfer?.files);
         if (!files.length) {
             hideOverlay();
             return;
         }
 
-        const input = getSubtitleInput();
+        const input = getSourceInput();
         if (!input) {
             hideOverlay();
             return;
@@ -872,7 +1135,11 @@ def _section_heading(title: str, description: str | None = None) -> None:
 
 
 def _status_strip(*items: str) -> None:
-    pills = "".join(f'<span class="status-pill">{item}</span>' for item in items if item)
+    pills = "".join(
+        f'<span class="status-pill">{html.escape(str(item))}</span>'
+        for item in items
+        if item
+    )
     if pills:
         st.markdown(f'<div class="status-strip">{pills}</div>', unsafe_allow_html=True)
 
@@ -886,44 +1153,71 @@ st.markdown(
     """
     <section class="app-hero">
         <div>
-            <p class="app-eyebrow">Subtitle translation studio</p>
+            <p class="app-eyebrow">Indic translation workspace</p>
             <h1>IndicSub</h1>
-            <p>English subtitle files to Bengali with protected terms, glossary overrides, and resumable output.</p>
+            <p>Context-aware translation for subtitles and documents, with exact structure mapping, protected terms, and resumable output.</p>
         </div>
         <div class="hero-badges">
-            <span class="hero-badge">.srt / .vtt</span>
+            <span class="hero-badge">.srt / .vtt / .txt / .md</span>
             <span class="hero-badge">Local-first</span>
-            <span class="hero-badge">Bengali output</span>
+            <span class="hero-badge">Structure-safe</span>
         </div>
     </section>
     """,
     unsafe_allow_html=True,
 )
 
+with st.container(border=True):
+    _section_heading(
+        "Source file",
+        "Start with a timed subtitle or a plain-text/Markdown document.",
+    )
+    uploaded_file = st.file_uploader(
+        "Subtitle or document",
+        type=["srt", "vtt", "txt", "md"],
+        help=HELP_TEXT["source_file"],
+    )
+    st.caption(
+        "Subtitle timing stays fixed. TXT paragraph spacing and conservative Markdown "
+        "structure (headings, lists, links, code, and HTML) are preserved."
+    )
+
+uploaded_ext = Path(uploaded_file.name).suffix.lower() if uploaded_file else ""
+source_kind = (
+    "subtitle"
+    if uploaded_ext in SUBTITLE_EXTENSIONS
+    else "document"
+    if uploaded_ext in DOCUMENT_EXTENSIONS
+    else None
+)
+
+sarvam_api_key = ""
+sarvam_model = "mayura:v1"
+sarvam_mode = "classic-colloquial"
+sarvam_fallback_enabled = False
+sarvam_save_key = False
+max_line_length = 42
+max_lines = 2
+
 with st.sidebar:
-    st.markdown("## Controls")
+    st.markdown("## Translation setup")
     with st.container(border=True):
-        _section_heading("Provider", "Translation backend and model source.")
+        _section_heading("Provider", "Local by default; hosted translation is opt-in.")
         backend = st.selectbox(
-            "Backend",
-            ["indictrans2", "sarvam-api", "echo", "nllb"],
+            "Translation provider",
+            list(PROVIDER_OPTIONS),
             index=0,
+            format_func=lambda value: PROVIDER_OPTIONS[value],
             help=HELP_TEXT["backend"],
         )
-        model_path = st.text_input(
-            "Local model path",
-            value="./models/indictrans2-en-indic",
-            help=HELP_TEXT["model_path"],
-        )
+        if backend in {"indictrans2", "nllb"}:
+            st.caption("Offline mode: source text stays on this machine.")
+        elif backend == "echo":
+            st.caption("Structure test only: output text is not translated.")
 
-    sarvam_api_key = ""
-    sarvam_model = "mayura:v1"
-    sarvam_mode = "classic-colloquial"
-    sarvam_fallback_enabled = False
-    sarvam_save_key = False
     if backend == "sarvam-api":
         with st.container(border=True):
-            _section_heading("Sarvam API", "Hosted model settings.")
+            _section_heading("Sarvam API", "Hosted provider and fallback policy.")
             sarvam_api_key = st.text_input(
                 "Sarvam API key",
                 value="",
@@ -938,264 +1232,641 @@ with st.sidebar:
             sarvam_model = st.selectbox(
                 "Sarvam model",
                 ["mayura:v1", "sarvam-translate:v1"],
-                index=0,
+                index=1 if source_kind == "document" else 0,
                 help=HELP_TEXT["sarvam_model"],
             )
             mode_options = ["classic-colloquial", "modern-colloquial", "formal"]
             sarvam_mode = st.selectbox(
-                "Sarvam mode",
+                "Translation mode",
                 mode_options,
                 index=0,
                 disabled=sarvam_model == "sarvam-translate:v1",
                 help=HELP_TEXT["sarvam_mode"],
             )
             sarvam_fallback_enabled = st.checkbox(
-                "Use local IndicTrans backup if Sarvam fails",
+                "Use local IndicTrans backup",
                 value=False,
                 help=HELP_TEXT["sarvam_fallback"],
             )
             if sarvam_fallback_enabled:
                 st.warning(
-                    "Backup fallback is ON. If Sarvam fails, the output may come from "
-                    "local IndicTrans and will be flagged for review."
+                    "Local backup is ON. A failed API window may come from IndicTrans; "
+                    "mixed-provider output will be flagged in Review."
+                )
+            else:
+                st.caption(
+                    "Strict provider mode: an API failure stops and checkpoints the run."
                 )
 
     with st.container(border=True):
-        _section_heading("Languages", "Source and target locale.")
+        _section_heading(
+            "Languages",
+            "Only routes supported by the selected provider are shown.",
+        )
+        indic_codes = [code for code in LANGUAGE_OPTIONS if code != "en"]
+        if backend == "indictrans2":
+            source_options = ["en"]
+            target_options = indic_codes
+            language_profile = "en_indic"
+        elif backend == "nllb":
+            source_options = ["en"]
+            target_options = ["bn"]
+            language_profile = "nllb_en_bn"
+        elif backend == "sarvam-api":
+            primary_codes = (
+                list(SARVAM_MAYURA_CODES)
+                if sarvam_model == "mayura:v1"
+                else list(LANGUAGE_OPTIONS)
+            )
+            if sarvam_fallback_enabled:
+                # The backup checkpoint is English→Indic only, so the UI exposes
+                # the intersection of the primary and backup route sets.
+                source_options = ["en"]
+                target_options = [
+                    code for code in primary_codes if code != "en" and code in indic_codes
+                ]
+                language_profile = f"sarvam_{sarvam_model}_local_backup"
+            else:
+                source_options = primary_codes
+                target_options = primary_codes
+                language_profile = f"sarvam_{sarvam_model}_strict"
+        else:
+            source_options = list(LANGUAGE_OPTIONS)
+            target_options = list(LANGUAGE_OPTIONS)
+            language_profile = "echo_bidirectional"
+
         source_lang = st.selectbox(
             "Source language",
-            ["en", "hi", "bn"],
-            index=0,
+            source_options,
+            index=source_options.index("en") if "en" in source_options else 0,
+            format_func=lambda value: LANGUAGE_OPTIONS[value],
             help=HELP_TEXT["source_lang"],
+            key=f"source_language_{language_profile}",
         )
         target_lang = st.selectbox(
             "Target language",
-            ["bn", "hi", "en"],
-            index=0,
+            target_options,
+            index=target_options.index("bn") if "bn" in target_options else 0,
+            format_func=lambda value: LANGUAGE_OPTIONS[value],
             help=HELP_TEXT["target_lang"],
+            key=f"target_language_{language_profile}",
         )
+        if source_lang == target_lang:
+            st.warning("Choose different source and target languages before translating.")
 
     with st.container(border=True):
-        _section_heading("Formatting", "Batching and subtitle line limits.")
-        chunk_size = st.slider("Batch chunk size", 1, 64, 12, help=HELP_TEXT["chunk_size"])
-        merge_min_chars = st.slider(
-            "Merge cues below chars",
-            10,
+        unit_name = (
+            "cues"
+            if source_kind == "subtitle"
+            else "blocks"
+            if source_kind == "document"
+            else "units"
+        )
+        _section_heading(
+            "Context",
+            f"Group related {unit_name} without losing their boundaries.",
+        )
+        context_slider_max = (
+            1800
+            if backend == "sarvam-api" and sarvam_model == "sarvam-translate:v1"
+            else 1800
+            if backend == "echo"
+            else 900
+        )
+        context_window_chars = st.slider(
+            "Context character budget",
             200,
-            60,
-            help=HELP_TEXT["merge_min_chars"],
+            context_slider_max,
+            700,
+            step=50,
+            help=HELP_TEXT["context_window_chars"],
+            key=(
+                f"context_char_budget_{backend}_"
+                f"{sarvam_model if backend == 'sarvam-api' else 'local'}"
+            ),
         )
-        max_line_length = st.slider(
-            "Max line length",
-            20,
-            60,
-            42,
-            help=HELP_TEXT["max_line_length"],
+        context_window_units = st.slider(
+            f"Maximum {unit_name} per context window",
+            1,
+            16,
+            8 if source_kind != "document" else 6,
+            help=HELP_TEXT["context_window_units"],
+            key=f"context_units_{source_kind or 'generic'}",
         )
-        max_lines = st.slider("Max lines per cue", 1, 4, 2, help=HELP_TEXT["max_lines"])
-
-    with st.container(border=True):
-        _section_heading("Run Mode")
-        echo_mode = st.checkbox(
-            "Echo/test mode (skip real translation)",
-            value=False,
-            help=HELP_TEXT["echo_mode"],
-        )
-
-input_col, glossary_col = st.columns([0.9, 1.1], gap="large")
-with input_col:
-    with st.container(border=True):
-        _section_heading("Source Subtitle", "Upload the subtitle file to process.")
-        uploaded_file = st.file_uploader(
-            "Subtitle file",
-            type=["srt", "vtt"],
-            help=HELP_TEXT["subtitle_file"],
+        st.caption(
+            "If a model changes boundary markers, only that window is retried one unit at a time."
         )
 
-with glossary_col:
-    with st.container(border=True):
-        _section_heading("Glossary & Protected Terms", "Overrides and do-not-translate entries.")
+    with st.expander("Advanced settings", expanded=False):
+        model_profile = "nllb" if backend == "nllb" else "indictrans2"
+        model_path = st.text_input(
+            "Local model path",
+            value=(
+                "./models/nllb-200-distilled-600M"
+                if model_profile == "nllb"
+                else "./models/indictrans2-en-indic"
+            ),
+            help=HELP_TEXT["model_path"],
+            key=f"local_model_path_{model_profile}",
+            disabled=(
+                backend == "echo"
+                or (backend == "sarvam-api" and not sarvam_fallback_enabled)
+            ),
+        )
+        chunk_size = st.slider(
+            "Pipeline batch size",
+            1,
+            64,
+            12,
+            help=HELP_TEXT["chunk_size"],
+        )
+        if source_kind == "subtitle":
+            max_line_length = st.slider(
+                "Subtitle line length",
+                20,
+                60,
+                42,
+                help=HELP_TEXT["max_line_length"],
+            )
+            max_lines = st.slider(
+                "Maximum lines per cue",
+                1,
+                4,
+                2,
+                help=HELP_TEXT["max_lines"],
+            )
+        elif source_kind == "document":
+            st.caption("Document wrapping is preserved by its TXT/Markdown adapter.")
+
+with st.expander("Glossary & protected terms · optional", expanded=False):
+    glossary_upload_col, glossary_editor_col = st.columns([0.34, 0.66], gap="large")
+    with glossary_upload_col:
         uploaded_glossary = st.file_uploader(
             "Glossary JSON",
             type=["json"],
             help=HELP_TEXT["glossary_file"],
         )
+        st.caption(
+            "Glossary replacements run after translation. Protected terms are masked before "
+            "translation and restored exactly."
+        )
+    with glossary_editor_col:
         if uploaded_glossary:
-            glossary_raw = uploaded_glossary.getvalue().decode("utf-8")
-        else:
-            glossary_raw = json.dumps(DEFAULT_GLOSSARY, ensure_ascii=False, indent=2)
-
+            glossary_seed = uploaded_glossary.getvalue().decode("utf-8")
+            glossary_upload_signature = hashlib.sha256(
+                uploaded_glossary.getvalue()
+            ).hexdigest()
+            if (
+                st.session_state.get("glossary_upload_signature")
+                != glossary_upload_signature
+            ):
+                st.session_state.glossary_json_editor = glossary_seed
+                st.session_state.glossary_upload_signature = glossary_upload_signature
+        elif "glossary_json_editor" not in st.session_state:
+            st.session_state.glossary_json_editor = json.dumps(
+                DEFAULT_GLOSSARY,
+                ensure_ascii=False,
+                indent=2,
+            )
         glossary_raw = st.text_area(
-            "Glossary JSON",
-            value=glossary_raw,
-            height=220,
+            "Glossary JSON editor",
+            height=260,
             help=HELP_TEXT["glossary_json"],
+            key="glossary_json_editor",
         )
 
-if uploaded_file:
+if not uploaded_file:
+    with st.container(border=True):
+        _section_heading(
+            "Workspace",
+            "Upload once, inspect the plan, translate, then review and export.",
+        )
+        st.info(
+            "Supported now: SubRip (.srt), WebVTT (.vtt), plain text (.txt), and "
+            "conservative Markdown (.md)."
+        )
+else:
     try:
-        ext = Path(uploaded_file.name).suffix
-        content = decode_subtitle_bytes(uploaded_file.getvalue())
-        document = parse_subtitle(content, ext)
+        source_bytes = uploaded_file.getvalue()
+        content = decode_subtitle_bytes(source_bytes)
+        ext = uploaded_ext
+        if source_kind == "subtitle":
+            document = parse_subtitle(content, ext)
+            unit_count = len(document.cues)
+            translatable_chars = sum(len(cue.text) for cue in document.cues)
+            effective_chars = _effective_plan_char_limit(
+                backend=backend,
+                sarvam_model=sarvam_model,
+                sarvam_fallback_enabled=sarvam_fallback_enabled,
+                requested=context_window_chars,
+            )
+            context_windows = _estimated_context_windows(
+                (cue.text for cue in document.cues),
+                max_chars=effective_chars,
+                max_units=context_window_units,
+            )
+            unit_label = "cues"
+            format_label = ext[1:].upper() + " subtitle"
+            structure_note = (
+                "Cue timings, indices, speaker labels, markup, and ALL-CAPS sound "
+                "cues stay mapped to their source cue."
+            )
+        elif source_kind == "document":
+            document = parse_document(content, ext)
+            unit_count = len(document.translatable_blocks)
+            translatable_chars = sum(
+                len(block.source_text) for block in document.translatable_blocks
+            )
+            effective_chars = _effective_plan_char_limit(
+                backend=backend,
+                sarvam_model=sarvam_model,
+                sarvam_fallback_enabled=sarvam_fallback_enabled,
+                requested=context_window_chars,
+            )
+            context_windows = _estimated_document_windows(
+                document,
+                max_chars=effective_chars,
+                max_blocks=context_window_units,
+            )
+            unit_label = "translatable blocks"
+            format_label = (
+                "Markdown document" if ext == ".md" else "Plain-text document"
+            )
+            protected_count = sum(
+                len(block.protected_spans) for block in document.translatable_blocks
+            )
+            structure_note = (
+                f"{len(document.blocks) - unit_count} structural blocks and {protected_count} "
+                "inline code/link/HTML spans will bypass translation and be restored in place."
+            )
+        else:
+            raise DocumentParseError(f"Unsupported source format: {ext or 'unknown'}")
 
-        if uploaded_file.name != st.session_state.last_file_name:
-            st.session_state.translated_text = ""
-            st.session_state.last_file_name = uploaded_file.name
+        planned_char_limit = _effective_plan_char_limit(
+            backend=backend,
+            sarvam_model=sarvam_model,
+            sarvam_fallback_enabled=sarvam_fallback_enabled,
+            requested=context_window_chars,
+        )
+        requires_local_model = backend in {"indictrans2", "nllb"} or (
+            backend == "sarvam-api" and sarvam_fallback_enabled
+        )
+        expected_local_backend = "nllb" if backend == "nllb" else "indictrans2"
+        if requires_local_model:
+            local_model_ready, local_model_identity, local_model_message = (
+                _local_model_status(model_path, expected_local_backend)
+            )
+        else:
+            local_model_ready = True
+            local_model_identity = _local_model_identity(model_path)
+            local_model_message = "Local model is not used by this provider configuration."
+        provider_identity = (
+            f"IndicTrans2 · {local_model_identity} · offline"
+            if backend == "indictrans2"
+            else f"NLLB · {local_model_identity} · offline"
+            if backend == "nllb"
+            else (
+                f"Sarvam API · {sarvam_model} · backup IndicTrans2 · "
+                f"{local_model_identity}"
+            )
+            if backend == "sarvam-api" and sarvam_fallback_enabled
+            else f"Sarvam API · {sarvam_model}"
+            if backend == "sarvam-api"
+            else "Echo · no model inference"
+        )
+        fallback_label = (
+            ("Local backup ready" if local_model_ready else "Local backup not ready")
+            if backend == "sarvam-api" and sarvam_fallback_enabled
+            else "Fallback off"
+        )
+        effective_batch = 1 if backend == "sarvam-api" else chunk_size
 
-        if document.warnings:
+        signature_settings = {
+            "source_name": uploaded_file.name,
+            "source_ext": ext,
+            "backend": backend,
+            "model_path": model_path,
+            "sarvam_model": sarvam_model,
+            "sarvam_mode": sarvam_mode,
+            "sarvam_fallback": sarvam_fallback_enabled,
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "chunk_size": chunk_size,
+            "context_window_chars": context_window_chars,
+            "context_window_units": context_window_units,
+            "max_line_length": max_line_length,
+            "max_lines": max_lines,
+        }
+        current_job_signature = _job_signature(
+            source_bytes,
+            signature_settings,
+            glossary_raw,
+        )
+        if st.session_state.active_job_signature != current_job_signature:
+            _clear_result()
+            st.session_state.active_job_signature = current_job_signature
+        st.session_state.last_file_name = uploaded_file.name
+
+        parse_warnings = list(document.warnings)
+        if parse_warnings:
             st.warning(
-                "Parser skipped {n} malformed block(s):\n- ".format(n=len(document.warnings))
-                + "\n- ".join(document.warnings)
+                f"Parser reported {len(parse_warnings)} note(s). Open Review for details."
             )
 
         _status_strip(
             uploaded_file.name,
-            f"{len(document.cues)} cues",
-            f"{source_lang} -> {target_lang}",
-            "Echo mode" if echo_mode else backend,
+            format_label,
+            f"{LANGUAGE_OPTIONS[source_lang]} → {LANGUAGE_OPTIONS[target_lang]}",
+            provider_identity,
+            fallback_label,
         )
 
         with st.container(border=True):
-            _section_heading("Subtitle Preview", "Original cues and the latest translated preview.")
-            col1, col2 = st.columns(2, gap="large")
-            with col1:
-                preview = "\n\n".join([cue.text for cue in document.cues[:6]])
-                st.text_area("Original", value=preview, height=260, disabled=True)
-
-            with col2:
-                st.text_area(
-                    "Translated",
-                    value=st.session_state.translated_text or "Run translation to see preview",
-                    height=260,
-                    disabled=True,
+            _section_heading(
+                "Translation plan",
+                "A preflight view of what will be grouped, preserved, and sent to the provider.",
+            )
+            metric_cols = st.columns(4, gap="medium")
+            metric_cols[0].metric("Format", format_label)
+            metric_cols[1].metric("Translation units", f"{unit_count:,} {unit_label}")
+            metric_cols[2].metric("Text to translate", f"{translatable_chars:,} chars")
+            metric_cols[3].metric("Context windows", f"≈ {context_windows:,}")
+            st.caption(structure_note)
+            _status_strip(
+                f"Up to {planned_char_limit} chars / window",
+                f"Up to {context_window_units} {unit_label.split()[-1]} / window",
+                f"{effective_batch} window{'s' if effective_batch != 1 else ''} / pipeline batch",
+                "Checkpoint resume on",
+            )
+            if planned_char_limit < context_window_chars:
+                st.info(
+                    f"The provider limit reduces the requested {context_window_chars}-character "
+                    f"window to {planned_char_limit} characters with safety headroom."
                 )
+            if backend == "indictrans2" and "dist-200M" in local_model_identity:
+                st.info(
+                    "Quality profile: the installed model is the faster distilled 200M "
+                    "checkpoint. For maximum local quality, install the full 1B checkpoint "
+                    "with `python scripts/download_models.py --model 1B`, then select its "
+                    "printed model path. It needs more RAM and runs more slowly."
+                )
+            if requires_local_model:
+                readiness_message = (
+                    f"Local backup · {local_model_message}"
+                    if backend == "sarvam-api"
+                    else local_model_message
+                )
+                if local_model_ready:
+                    st.success(readiness_message)
+                else:
+                    st.error(readiness_message)
+                    if backend == "sarvam-api":
+                        st.caption(
+                            "Disable local backup to run strict Sarvam mode, or select a valid "
+                            "IndicTrans2 checkpoint before translating."
+                        )
 
         with st.container(border=True):
             action_col, detail_col = st.columns([0.28, 0.72], gap="large")
             with action_col:
                 translate_clicked = st.button(
-                    "Translate",
+                    "Translate file",
                     type="primary",
                     use_container_width=True,
+                    disabled=(
+                        source_lang == target_lang
+                        or unit_count == 0
+                        or (requires_local_model and not local_model_ready)
+                    ),
                 )
             with detail_col:
-                _status_strip(
-                    f"Chunk {chunk_size}",
-                    f"Merge under {merge_min_chars}",
-                    f"{max_line_length} chars",
-                    f"{max_lines} lines",
+                _section_heading(
+                    "Ready to translate" if local_model_ready else "Model setup required",
+                    (
+                        "The source is translated in semantic windows, then restored to exact "
+                        "file structure."
+                        if local_model_ready
+                        else local_model_message
+                    ),
                 )
 
+        translator = None
         if translate_clicked:
+            # A new attempt owns the output area even if provider or glossary
+            # initialization fails; never leave an earlier result looking current.
+            _clear_result()
             try:
-                glossary_cfg: GlossaryConfig = load_glossary_json(glossary_raw)
-            except Exception as exc:
-                st.error(f"Invalid glossary JSON: {exc}")
-                st.stop()
+                try:
+                    glossary_cfg: GlossaryConfig = load_glossary_json(glossary_raw)
+                except Exception as exc:
+                    st.error(f"Invalid glossary JSON: {exc}")
+                    st.stop()
 
-            with st.spinner("Initializing translator..."):
-                selected_backend = "echo" if echo_mode else backend
-                if selected_backend == "sarvam-api" and sarvam_save_key and sarvam_api_key:
+                if backend == "sarvam-api" and sarvam_save_key and sarvam_api_key:
                     try:
                         save_sarvam_api_key(sarvam_api_key)
                     except CredentialStorageError as exc:
                         st.warning(str(exc))
 
-                translator = build_translator(
-                    selected_backend,
-                    model_path=model_path,
-                    sarvam_api_key=sarvam_api_key,
-                    sarvam_model=sarvam_model,
-                    sarvam_mode=sarvam_mode,
-                    sarvam_fallback_backend=(
-                        "indictrans2"
-                        if selected_backend == "sarvam-api" and sarvam_fallback_enabled
-                        else None
-                    ),
+                with st.spinner("Initializing translation provider..."):
+                    translator = build_translator(
+                        backend,
+                        model_path=model_path,
+                        sarvam_api_key=sarvam_api_key,
+                        sarvam_model=sarvam_model,
+                        sarvam_mode=sarvam_mode,
+                        sarvam_fallback_backend=(
+                            "indictrans2"
+                            if backend == "sarvam-api" and sarvam_fallback_enabled
+                            else None
+                        ),
+                    )
+                    st.info(f"Active provider: {translator.display_name}")
+
+                progress = st.progress(0.0, text="Preparing context windows...")
+                checkpoint_path = make_translation_checkpoint_path(
+                    uploaded_file.name,
+                    source_bytes,
                 )
-                st.info(f"Translation provider: {translator.display_name}")
 
-            settings = TranslationSettings(
-                source_lang=source_lang,
-                target_lang=target_lang,
-                chunk_size=chunk_size,
-                merge_min_chars=merge_min_chars,
-                max_line_length=max_line_length,
-                max_lines=max_lines,
-            )
+                def on_progress(value: float, message: str) -> None:
+                    progress.progress(value, text=message)
 
-            progress = st.progress(0.0, text="Starting...")
-            checkpoint_path = make_translation_checkpoint_path(
-                uploaded_file.name,
-                uploaded_file.getvalue(),
-            )
+                if source_kind == "subtitle":
+                    translated_document = translate_document(
+                        document=document,
+                        translator=translator,
+                        settings=TranslationSettings(
+                            source_lang=source_lang,
+                            target_lang=target_lang,
+                            chunk_size=chunk_size,
+                            context_window_chars=context_window_chars,
+                            context_window_cues=context_window_units,
+                            max_line_length=max_line_length,
+                            max_lines=max_lines,
+                        ),
+                        glossary=glossary_cfg,
+                        progress_cb=on_progress,
+                        checkpoint_path=checkpoint_path,
+                    )
+                    output_text = serialize_subtitle(translated_document)
+                else:
+                    translated_document = translate_text_document(
+                        document=document,
+                        translator=translator,
+                        settings=DocumentTranslationSettings(
+                            source_lang=source_lang,
+                            target_lang=target_lang,
+                            chunk_size=chunk_size,
+                            context_window_chars=context_window_chars,
+                            context_window_blocks=context_window_units,
+                        ),
+                        glossary=glossary_cfg,
+                        progress_cb=on_progress,
+                        checkpoint_path=checkpoint_path,
+                    )
+                    output_text = serialize_document(translated_document)
 
-            def on_progress(value: float, message: str) -> None:
-                progress.progress(value, text=message)
-
-            translated_doc = translate_document(
-                document=document,
-                translator=translator,
-                settings=settings,
-                glossary=glossary_cfg,
-                progress_cb=on_progress,
-                checkpoint_path=checkpoint_path,
-            )
-            output_text = serialize_subtitle(translated_doc)
-            st.session_state.translated_text = "\n\n".join([cue.text for cue in translated_doc.cues[:6]])
-
-            output_name = f"{Path(uploaded_file.name).stem}.translated{ext}"
-            st.success("Translation complete.")
-            st.info(f"Provider used: {translator.usage_summary}")
-            if _fallback_was_used(translator):
-                st.warning(
-                    "Fallback was used. This output was not fully produced by Sarvam; "
-                    "review the notes below before trusting the file."
+                result_warnings = list(translated_document.warnings)
+                if _fallback_was_used(translator):
+                    result_warnings.append(
+                        "Local fallback was used for at least one provider batch. Review "
+                        "mixed-provider phrasing."
+                    )
+                output_name = f"{Path(uploaded_file.name).stem}.translated{ext}"
+                _store_result(
+                    output_text,
+                    output_name=output_name,
+                    mime=_mime_type(ext),
+                    provider=translator.usage_summary,
+                    warnings=result_warnings,
                 )
-            if translated_doc.warnings:
-                st.warning(
-                    "Review notes:\n- " + "\n- ".join(translated_doc.warnings[:10])
-                    + ("\n- ..." if len(translated_doc.warnings) > 10 else "")
-                )
-            st.download_button(
-                label="Download translated subtitle",
-                data=output_text.encode("utf-8"),
-                file_name=output_name,
-                mime="text/plain",
-                use_container_width=True,
-            )
+                st.success("Translation complete. Review the full output before export.")
+                if _fallback_was_used(translator):
+                    st.warning("Local fallback was used and has been added to Review notes.")
 
-    except SubtitleParseError as exc:
+            except TranslationInterruptedError as exc:
+                partial_text = serialize_subtitle(exc.partial_document)
+                _store_result(
+                    partial_text,
+                    output_name=f"{Path(uploaded_file.name).stem}.partial{ext}",
+                    mime=_mime_type(ext),
+                    provider=translator.usage_summary if translator else provider_identity,
+                    warnings=exc.partial_document.warnings,
+                    partial=True,
+                )
+                st.error(f"Translation interrupted: {exc}")
+                if exc.checkpoint_path is not None:
+                    st.info(f"Checkpoint: {exc.checkpoint_path}")
+                    st.info("Run the same job again to resume instead of starting over.")
+            except DocumentTranslationInterruptedError as exc:
+                partial_text = serialize_document(exc.partial_document)
+                _store_result(
+                    partial_text,
+                    output_name=f"{Path(uploaded_file.name).stem}.partial{ext}",
+                    mime=_mime_type(ext),
+                    provider=translator.usage_summary if translator else provider_identity,
+                    warnings=exc.partial_document.warnings,
+                    partial=True,
+                )
+                st.error(f"Document translation interrupted: {exc}")
+                if exc.checkpoint_path is not None:
+                    st.info(f"Checkpoint: {exc.checkpoint_path}")
+                    st.info("Run the same job again to resume instead of starting over.")
+            except TranslatorInitError as exc:
+                st.error(f"Translator initialization error: {exc}")
+            except SarvamApiError as exc:
+                st.error(f"Sarvam API error: {exc}")
+                st.info(
+                    "With fallback off, the run stops instead of silently changing providers. "
+                    "Fix the API setup or explicitly enable local backup."
+                )
+            except FallbackTranslationError as exc:
+                st.error(f"Primary and fallback translation failed: {exc}")
+            except Exception as exc:
+                st.error(f"Unexpected translation error: {exc}")
+
+        with st.container(border=True):
+            _section_heading(
+                "Review & export",
+                "Inspect the complete source and output—not a shortened six-unit preview.",
+            )
+            compare_tab, output_tab, review_tab = st.tabs(
+                ["Side-by-side", "Output & export", "Review notes"]
+            )
+            with compare_tab:
+                source_review_col, translated_review_col = st.columns(2, gap="large")
+                with source_review_col:
+                    st.text_area(
+                        "Complete source",
+                        value=content,
+                        height=440,
+                        disabled=True,
+                    )
+                with translated_review_col:
+                    st.text_area(
+                        "Complete translation",
+                        value=(
+                            st.session_state.translated_text
+                            or "Run translation to populate the complete output."
+                        ),
+                        height=440,
+                        disabled=True,
+                    )
+            with output_tab:
+                if st.session_state.translated_text:
+                    st.text_area(
+                        "Translated file contents",
+                        value=st.session_state.translated_text,
+                        height=440,
+                        disabled=True,
+                    )
+                    download_label = (
+                        "Download partial output"
+                        if st.session_state.result_is_partial
+                        else "Download translated file"
+                    )
+                    st.download_button(
+                        label=download_label,
+                        data=st.session_state.translated_text.encode("utf-8"),
+                        file_name=st.session_state.result_output_name,
+                        mime=st.session_state.result_mime,
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("Run translation to populate the full output and download file.")
+            with review_tab:
+                combined_warnings = list(
+                    dict.fromkeys([*parse_warnings, *st.session_state.result_warnings])
+                )
+                if st.session_state.result_provider:
+                    _status_strip(
+                        f"Provider used: {st.session_state.result_provider}",
+                        (
+                            "Partial output"
+                            if st.session_state.result_is_partial
+                            else "Complete output"
+                        ),
+                    )
+                if combined_warnings:
+                    st.warning(f"{len(combined_warnings)} item(s) need review.")
+                    st.code(
+                        "\n".join(
+                            f"{index}. {warning}"
+                            for index, warning in enumerate(combined_warnings, 1)
+                        )
+                    )
+                elif st.session_state.translated_text:
+                    st.success(
+                        "No parser, alignment, corruption, glossary, or grammar flags "
+                        "were reported."
+                    )
+                else:
+                    st.info("Quality and alignment flags will appear here after translation.")
+
+    except (SubtitleParseError, DocumentParseError) as exc:
         st.error(f"Parsing error: {exc}")
-    except TranslatorInitError as exc:
-        st.error(f"Translator initialization error: {exc}")
-    except TranslationInterruptedError as exc:
-        partial_text = serialize_subtitle(exc.partial_document)
-        st.session_state.translated_text = "\n\n".join(
-            [cue.text for cue in exc.partial_document.cues[:6]]
-        )
-        st.error(f"Translation interrupted: {exc}")
-        if exc.checkpoint_path is not None:
-            st.info(f"Progress checkpoint saved at: {exc.checkpoint_path}")
-            st.info("Rerun with the same file, settings, glossary, and provider to resume.")
-        st.download_button(
-            label="Download partial translated subtitle",
-            data=partial_text.encode("utf-8"),
-            file_name=f"{Path(uploaded_file.name).stem}.partial{ext}",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    except SarvamApiError as exc:
-        st.error(f"Sarvam API error: {exc}")
-        st.info(
-            "Backup fallback is off, so translation stopped. Fix the Sarvam key/model/"
-            "language issue, or enable the local IndicTrans backup and rerun."
-        )
-    except FallbackTranslationError as exc:
-        st.error(f"Translation failed: {exc}")
+    except UnicodeError as exc:
+        st.error(f"Could not decode the uploaded text file: {exc}")
     except Exception as exc:
-        st.error(f"Unexpected error: {exc}")
-else:
-    with st.container(border=True):
-        _section_heading("Workspace")
-        st.info("Upload a subtitle file to begin.")
+        st.error(f"Unexpected workspace error: {exc}")

@@ -7,6 +7,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List
 
+from subtitle_translator.contextual import (
+    ContextSegment,
+    ContextWindow,
+    build_context_windows,
+    fit_context_windows,
+    translate_context_batch,
+)
 from subtitle_translator.defaults import merge_with_defaults
 from subtitle_translator.formatter import subtitle_line_break
 from subtitle_translator.glossary import (
@@ -14,9 +21,9 @@ from subtitle_translator.glossary import (
     apply_glossary_overrides,
     protect_terms,
     restore_terms,
+    validate_restored_terms,
 )
 from subtitle_translator.models import Cue, SubtitleDocument
-from subtitle_translator.segmentation import merge_short_cues, split_translated_chunk
 from subtitle_translator.translators.base import BaseTranslator
 from subtitle_translator.validation import validate_translation
 
@@ -37,7 +44,7 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _HTML_ENTITY_RE = re.compile(r"&[A-Za-z][A-Za-z0-9]+;")
 _LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 
-_CHECKPOINT_VERSION = 1
+_CHECKPOINT_VERSION = 2
 
 
 @dataclass
@@ -45,9 +52,21 @@ class TranslationSettings:
     source_lang: str = "en"
     target_lang: str = "bn"
     chunk_size: int = 12
-    merge_min_chars: int = 0
+    context_window_chars: int = 700
+    context_window_cues: int = 8
     max_line_length: int = 42
     max_lines: int = 2
+
+
+@dataclass(frozen=True)
+class _PreparedCue:
+    key: str
+    protected_text: str
+    speaker_name: str | None
+    wrapping_markup: tuple[str, str] | None
+    is_stage_direction: bool
+    preserve_verbatim: str | None
+    replacements: dict[str, str]
 
 
 class TranslationInterruptedError(RuntimeError):
@@ -86,18 +105,47 @@ def translate_document(
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
     checkpoint_identity = _checkpoint_identity(document, settings, glossary, translator)
 
-    chunks = merge_short_cues(document.cues, min_chars=settings.merge_min_chars)
+    # Preprocess each cue before packing context windows. This preserves every
+    # cue's speaker label, stage-direction semantics, and wrapping markup; the
+    # previous merge-first flow only handled those features on the first cue in
+    # a merged group.
+    prepared_cues = _prepare_cues(document.cues, glossary)
+    context_segments = [
+        ContextSegment(key=prepared.key, text=prepared.protected_text)
+        for prepared in prepared_cues
+    ]
+    input_acceptance_cache: dict[str, bool] = {}
+
+    def accepts_input(payload: str) -> bool:
+        if payload not in input_acceptance_cache:
+            input_acceptance_cache[payload] = translator.accepts_input(
+                payload,
+                settings.source_lang,
+                settings.target_lang,
+            )
+        return input_acceptance_cache[payload]
+
+    context_windows = build_context_windows(
+        context_segments,
+        max_chars=_effective_context_char_limit(translator, settings.context_window_chars),
+        max_segments=settings.context_window_cues,
+    )
+    context_windows = fit_context_windows(
+        context_windows,
+        accepts_input,
+    )
+    prepared_by_key = {prepared.key: prepared for prepared in prepared_cues}
     translated_cues: List[Cue] = [cue for cue in document.cues]
     completed_chunk_indices: set[int] = set()
-    translation_cache: dict[str, str] = {}
+    alignment_warnings: list[str] = []
     chunk_size = _effective_pipeline_chunk_size(translator, settings.chunk_size)
 
-    total = len(chunks)
+    total = len(context_windows)
     total_chunks = max(1, (total + chunk_size - 1) // chunk_size)
     if checkpoint is not None and resume_from_checkpoint:
         loaded = _load_checkpoint(checkpoint, checkpoint_identity, len(document.cues), total_chunks)
         if loaded is not None:
-            translated_cues, completed_chunk_indices = loaded
+            translated_cues, completed_chunk_indices, alignment_warnings = loaded
             if progress_cb and completed_chunk_indices:
                 progress_cb(
                     0.0,
@@ -116,8 +164,7 @@ def translate_document(
                 )
             continue
 
-        batch = chunks[offset : offset + chunk_size]
-        batch_texts = [item.text for item in batch]
+        batch = context_windows[offset : offset + chunk_size]
 
         try:
             if progress_cb:
@@ -126,62 +173,96 @@ def translate_document(
                     f"Translating {chunk_idx + 1}/{total_chunks} with {translator.display_name}...",
                 )
 
-            # Strip speaker labels (e.g. "POIROT: ") before sending to the model.
-            # The model cannot reliably preserve arbitrary token formats, so we
-            # never expose labels to it — we reattach them after translation.
-            extracted = [_extract_speaker_label(t) for t in batch_texts]
-            speaker_names = [s for s, _ in extracted]
-            body_texts = [b for _, b in extracted]
-
-            # Normalise ALL-CAPS stage directions so the model translates them
-            # semantically rather than phonetically transliterating them.
-            # "(BELL TOLLING)" → "(bell tolling)"; we track which were normalised
-            # so we can wrap the translation back in parentheses if needed.
-            normalised_texts, stage_flags = _normalise_stage_directions(body_texts)
-            model_texts, wrapping_markup = _extract_wrapping_markup(normalised_texts)
-
-            # Protect do-not-translate terms with bracket-free sentinels
-            # (ZZID{n}ZZ). Angle-bracket formats like <dnt>...</dnt> and <IDn>
-            # get garbled by the model — see scripts/spike_dnt.py for evidence.
-            # All-alphabetic sentinels are passed through verbatim.
-            protected_texts, replacements = protect_terms(
-                model_texts, glossary.do_not_translate
-            )
-            translated_batch = _translate_protected_texts(
-                protected_texts,
-                translator,
-                settings,
-                translation_cache,
-            )
-            translated_batch = restore_terms(translated_batch, replacements)
-            translated_batch = apply_glossary_overrides(translated_batch, glossary.glossary_map)
-            translated_batch = _restore_wrapping_markup(translated_batch, wrapping_markup)
-
-            # Re-wrap stage-direction translations in parentheses when the model
-            # stripped them (it sometimes drops surrounding punctuation).
-            translated_batch = _restore_stage_direction_parens(translated_batch, stage_flags)
-
-            # Reattach speaker labels. Use full-name glossary lookup only —
-            # NOT word-level substitution. Word-level was rewriting
-            # "CHIEF INSPECTOR" into "CHIEF পরিদর্শক" because the default
-            # Bengali glossary contains "inspector". User can still get
-            # "POIROT" → "পয়রট" by adding the whole label as a glossary key.
-            translated_batch = [
-                "{}: {}".format(_translate_speaker_label(name, glossary.glossary_map), text)
-                if name else text
-                for name, text in zip(speaker_names, translated_batch)
-            ]
-
-            for merged, translated in zip(batch, translated_batch):
-                split_texts = split_translated_chunk(translated, len(merged.cue_indices))
-                for cue_idx, cue_text in zip(merged.cue_indices, split_texts):
-                    formatted = subtitle_line_break(
-                        cue_text,
-                        max_line_length=settings.max_line_length,
-                        max_lines=settings.max_lines,
+            model_windows: list[ContextWindow] = []
+            translated_by_key: dict[str, str] = {}
+            for window in batch:
+                if any(
+                    prepared_by_key[segment.key].preserve_verbatim is None
+                    and _needs_model_translation(segment.text)
+                    for segment in window.segments
+                ):
+                    model_windows.append(window)
+                else:
+                    translated_by_key.update(
+                        {segment.key: segment.text for segment in window.segments}
                     )
-                    translated_cues[cue_idx] = translated_cues[cue_idx].with_text(formatted)
+
+            result = translate_context_batch(
+                model_windows,
+                translator,
+                source_lang=settings.source_lang,
+                target_lang=settings.target_lang,
+            )
+            translated_by_key.update(result.translations)
+            if result.alignment_fallback_keys:
+                cue_labels = [
+                    str(document.cues[int(key)].index or int(key) + 1)
+                    for key in result.alignment_fallback_keys
+                ]
+                alignment_warnings.append(
+                    "Context alignment was not preserved for cue(s) "
+                    + ", ".join(cue_labels)
+                    + "; those cues were safely retried one at a time."
+                )
+
+            batch_prepared = [
+                prepared_by_key[segment.key]
+                for window in batch
+                for segment in window.segments
+            ]
+            translated_batch = [
+                translated_by_key[prepared.key] for prepared in batch_prepared
+            ]
+            translated_batch = apply_glossary_overrides(
+                translated_batch, glossary.glossary_map
+            )
+            translated_batch = [
+                restore_terms([text], prepared.replacements)[0]
+                for prepared, text in zip(batch_prepared, translated_batch)
+            ]
+            for prepared, restored in zip(batch_prepared, translated_batch):
+                validate_restored_terms(
+                    prepared.protected_text,
+                    restored,
+                    prepared.replacements,
+                )
+            translated_batch = _restore_stage_direction_parens(
+                translated_batch,
+                [prepared.is_stage_direction for prepared in batch_prepared],
+            )
+            translated_batch = [
+                prepared.preserve_verbatim
+                if prepared.preserve_verbatim is not None
+                else text
+                for prepared, text in zip(batch_prepared, translated_batch)
+            ]
+            translated_batch = [
+                "{}: {}".format(
+                    _translate_speaker_label(prepared.speaker_name, glossary.glossary_map),
+                    text,
+                )
+                if prepared.speaker_name
+                else text
+                for prepared, text in zip(batch_prepared, translated_batch)
+            ]
+            translated_batch = _restore_wrapping_markup(
+                translated_batch,
+                [prepared.wrapping_markup for prepared in batch_prepared],
+            )
+
+            for prepared, translated in zip(batch_prepared, translated_batch):
+                cue_idx = int(prepared.key)
+                formatted = subtitle_line_break(
+                    translated,
+                    max_line_length=settings.max_line_length,
+                    max_lines=settings.max_lines,
+                )
+                translated_cues[cue_idx] = translated_cues[cue_idx].with_text(formatted)
         except Exception as exc:
+            _extend_unique(
+                alignment_warnings,
+                [str(value) for value in getattr(translator, "warnings", [])],
+            )
             message = (
                 f"Translation interrupted after {len(completed_chunk_indices)}/"
                 f"{total_chunks} chunks. Progress can be resumed with the same "
@@ -194,6 +275,7 @@ def translate_document(
                 translated_cues=translated_cues,
                 completed_chunk_indices=completed_chunk_indices,
                 total_chunks=total_chunks,
+                pipeline_warnings=alignment_warnings,
             )
             if checkpoint is not None and checkpoint_warning is None:
                 message += f" Checkpoint saved to {checkpoint}."
@@ -204,6 +286,7 @@ def translate_document(
                 translated_cues,
                 translator,
                 warning=message,
+                pipeline_warnings=alignment_warnings,
             )
             raise TranslationInterruptedError(
                 f"{message} Original error: {exc}",
@@ -212,6 +295,10 @@ def translate_document(
                 original_exception=exc,
             ) from exc
 
+        _extend_unique(
+            alignment_warnings,
+            [str(value) for value in getattr(translator, "warnings", [])],
+        )
         completed_chunk_indices.add(chunk_idx)
         _save_checkpoint(
             checkpoint,
@@ -220,6 +307,7 @@ def translate_document(
             translated_cues=translated_cues,
             completed_chunk_indices=completed_chunk_indices,
             total_chunks=total_chunks,
+            pipeline_warnings=alignment_warnings,
         )
 
         if progress_cb:
@@ -239,9 +327,19 @@ def translate_document(
         translated_texts=[c.text for c in translated_cues],
         cue_numbers=[c.index for c in document.cues],
         target_lang=settings.target_lang,
+        glossary_terms=glossary.glossary_map.keys(),
+        protected_terms=glossary.do_not_translate,
     )
-    warnings = list(document.warnings) + [issue.formatted() for issue in issues]
-    warnings.extend(str(w) for w in getattr(translator, "warnings", []))
+    warnings: list[str] = []
+    _extend_unique(
+        warnings,
+        [
+            *document.warnings,
+            *alignment_warnings,
+            *[issue.formatted() for issue in issues],
+            *[str(value) for value in getattr(translator, "warnings", [])],
+        ],
+    )
 
     return SubtitleDocument(
         format=document.format,
@@ -267,46 +365,51 @@ def make_translation_checkpoint_path(
     return Path(directory) / f"{safe_name}.{digest}.json"
 
 
-def _translate_protected_texts(
-    protected_texts: list[str],
-    translator: BaseTranslator,
-    settings: TranslationSettings,
-    translation_cache: dict[str, str],
-) -> list[str]:
-    translated: list[str | None] = [None] * len(protected_texts)
-    pending_texts: list[str] = []
-    pending_positions_by_text: dict[str, list[int]] = {}
-
-    for pos, text in enumerate(protected_texts):
-        if not _needs_model_translation(text):
-            translated[pos] = text
-            continue
-        cached = translation_cache.get(text)
-        if cached is not None:
-            translated[pos] = cached
-            continue
-        if text in pending_positions_by_text:
-            pending_positions_by_text[text].append(pos)
-        else:
-            pending_positions_by_text[text] = [pos]
-            pending_texts.append(text)
-
-    if pending_texts:
-        pending_translated = translator.translate_batch(
-            pending_texts,
-            source_lang=settings.source_lang,
-            target_lang=settings.target_lang,
+def _prepare_cues(
+    cues: List[Cue],
+    glossary: GlossaryConfig,
+) -> list[_PreparedCue]:
+    model_texts, wrapping_markup = _extract_wrapping_markup([cue.text for cue in cues])
+    extracted = [_extract_speaker_label(text) for text in model_texts]
+    speaker_names = [speaker for speaker, _ in extracted]
+    body_texts = [body for _, body in extracted]
+    normalised_texts, stage_flags = _normalise_stage_directions(body_texts)
+    protected_with_replacements = [
+        protect_terms([text], glossary.do_not_translate)
+        for text in normalised_texts
+    ]
+    protected_texts = [protected[0][0] for protected in protected_with_replacements]
+    replacements = [protected[1] for protected in protected_with_replacements]
+    prepared = [
+        _PreparedCue(
+            key=str(index),
+            protected_text=protected,
+            speaker_name=speaker,
+            wrapping_markup=wrapper,
+            is_stage_direction=is_stage,
+            preserve_verbatim=(body_texts[index] if is_stage else None),
+            replacements=replacements[index],
         )
-        if len(pending_translated) != len(pending_texts):
-            raise RuntimeError(
-                "Translator returned a different number of lines than requested."
-            )
-        for original, out in zip(pending_texts, pending_translated):
-            translation_cache[original] = out
-            for pos in pending_positions_by_text[original]:
-                translated[pos] = out
+        for index, (protected, speaker, wrapper, is_stage) in enumerate(
+            zip(protected_texts, speaker_names, wrapping_markup, stage_flags)
+        )
+    ]
+    return prepared
 
-    return [text or "" for text in translated]
+
+def _effective_context_char_limit(
+    translator: BaseTranslator,
+    requested_chars: int,
+) -> int:
+    requested = max(1, int(requested_chars))
+    provider_limit = getattr(translator, "max_input_chars", None)
+    if not isinstance(provider_limit, int):
+        provider = getattr(translator, "primary", translator)
+        provider_limit = getattr(provider, "max_input_chars", None)
+    if isinstance(provider_limit, int) and provider_limit > 0:
+        # Leave headroom for boundary markers and provider-side normalization.
+        return min(requested, max(1, int(provider_limit * 0.9)))
+    return requested
 
 
 def _effective_pipeline_chunk_size(translator: BaseTranslator, requested_chunk_size: int) -> int:
@@ -362,7 +465,7 @@ def _checkpoint_identity(
         "source_hash": _document_hash(document),
         "settings": asdict(settings),
         "glossary_hash": _glossary_hash(glossary),
-        "provider": translator.display_name,
+        "provider": translator.checkpoint_fingerprint,
     }
 
 
@@ -404,7 +507,7 @@ def _load_checkpoint(
     identity: dict,
     cue_count: int,
     total_chunks: int,
-) -> tuple[List[Cue], set[int]] | None:
+) -> tuple[List[Cue], set[int], list[str]] | None:
     if not checkpoint_path.exists():
         return None
 
@@ -422,9 +525,12 @@ def _load_checkpoint(
 
     cue_payloads = data.get("translated_cues")
     completed = data.get("completed_chunk_indices")
+    stored_warnings = data.get("pipeline_warnings", [])
     if not isinstance(cue_payloads, list) or len(cue_payloads) != cue_count:
         return None
     if not isinstance(completed, list):
+        return None
+    if not isinstance(stored_warnings, list):
         return None
 
     cues: List[Cue] = []
@@ -435,7 +541,7 @@ def _load_checkpoint(
     except (TypeError, ValueError, KeyError):
         return None
 
-    return cues, completed_indices
+    return cues, completed_indices, [str(value) for value in stored_warnings]
 
 
 def _save_checkpoint(
@@ -446,6 +552,7 @@ def _save_checkpoint(
     translated_cues: List[Cue],
     completed_chunk_indices: set[int],
     total_chunks: int,
+    pipeline_warnings: list[str],
 ) -> str | None:
     if checkpoint_path is None:
         return None
@@ -457,6 +564,7 @@ def _save_checkpoint(
         "header_lines": document.header_lines,
         "total_chunks": total_chunks,
         "completed_chunk_indices": sorted(completed_chunk_indices),
+        "pipeline_warnings": pipeline_warnings,
         "translated_cues": [_cue_to_checkpoint_payload(cue) for cue in translated_cues],
     }
 
@@ -504,10 +612,18 @@ def _build_partial_document(
     translator: BaseTranslator,
     *,
     warning: str,
+    pipeline_warnings: list[str],
 ) -> SubtitleDocument:
-    warnings = list(document.warnings)
-    warnings.append(warning)
-    warnings.extend(str(w) for w in getattr(translator, "warnings", []))
+    warnings: list[str] = []
+    _extend_unique(
+        warnings,
+        [
+            *document.warnings,
+            *pipeline_warnings,
+            warning,
+            *[str(value) for value in getattr(translator, "warnings", [])],
+        ],
+    )
     return SubtitleDocument(
         format=document.format,
         cues=translated_cues,
@@ -536,10 +652,11 @@ def _translate_speaker_label(name: str, glossary_map: dict) -> str:
 
 
 def _normalise_stage_directions(texts: List[str]):
-    """Lower-case ALL-CAPS parenthetical stage directions for better translation.
+    """Lower-case ALL-CAPS directions when they are included as model context.
 
-    Returns (normalised_texts, flags) where flags[i] is True when text[i] was
-    a stage direction so the caller can re-wrap after translation.
+    The original text is restored verbatim after translation. Returns
+    ``(normalised_texts, flags)`` so callers can identify these context-only
+    units without exposing model output for them.
     """
     normalised: List[str] = []
     flags: List[bool] = []
@@ -566,3 +683,9 @@ def _restore_stage_direction_parens(texts: List[str], flags: List[bool]) -> List
         else:
             out.append(text)
     return out
+
+
+def _extend_unique(destination: list[str], values: List[str]) -> None:
+    for value in values:
+        if value and value not in destination:
+            destination.append(value)

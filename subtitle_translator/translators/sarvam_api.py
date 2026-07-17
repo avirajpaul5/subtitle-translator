@@ -124,6 +124,13 @@ class SarvamApiTranslator(BaseTranslator):
         return f"Sarvam API ({self.model})"
 
     @property
+    def checkpoint_fingerprint(self) -> str:
+        return (
+            f"{self.display_name}|numerals={self.numerals_format}|"
+            f"endpoint={self.endpoint}|input_chars={self.max_input_chars}"
+        )
+
+    @property
     def pipeline_chunk_size(self) -> int:
         return 1
 

@@ -9,6 +9,7 @@ from subtitle_translator.models import Cue, SubtitleDocument
 from subtitle_translator.pipeline import TranslationSettings, translate_document
 from subtitle_translator.translators.echo import EchoTranslator
 from subtitle_translator.validation import (
+    flag_glossary_coverage,
     flag_grammar_issues,
     has_corruption,
     validate_translation,
@@ -93,6 +94,14 @@ def test_grammar_english_word_before_indic():
     )
 
 
+def test_grammar_does_not_flag_an_intentionally_protected_foreign_term():
+    assert flag_grammar_issues(
+        "Monsieur এসেছেন।",
+        target_lang="bn",
+        protected_terms=["Monsieur"],
+    ) == []
+
+
 def test_grammar_bengali_subject_verb_mismatch():
     # "আমি একটি X ছিল" should be "ছিলাম" — common model error.
     assert "subject_verb_mismatch" in flag_grammar_issues(
@@ -112,6 +121,23 @@ def test_grammar_bengali_subject_verb_mismatch():
 def test_grammar_clean_lines_unflagged():
     assert flag_grammar_issues("সে দরজা খুলল।", target_lang="bn") == []
     assert flag_grammar_issues("She opened the door.") == []
+
+
+def test_glossary_coverage_flags_a_must_translate_term_left_in_output():
+    assert flag_glossary_coverage(
+        "The doctor arrived.",
+        "Doctor এসেছেন।",
+        ["doctor"],
+    ) == ["glossary_term_untranslated:doctor"]
+
+
+def test_glossary_coverage_excludes_explicitly_protected_terms():
+    assert flag_glossary_coverage(
+        "The doctor arrived.",
+        "Doctor এসেছেন।",
+        ["doctor"],
+        ["doctor"],
+    ) == []
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +167,20 @@ def test_validate_translation_unknown_lang_falls_back_to_universal():
     issues = validate_translation(orig, trans, [1, 2], target_lang="zz")
     assert len(issues) == 1
     assert issues[0].cue_number == 2
+
+
+def test_validate_translation_includes_glossary_coverage():
+    issues = validate_translation(
+        ["The doctor arrived."],
+        ["Doctor এসেছেন।"],
+        [7],
+        target_lang="bn",
+        glossary_terms=["doctor"],
+    )
+
+    assert len(issues) == 1
+    assert issues[0].cue_number == 7
+    assert "glossary_term_untranslated:doctor" in issues[0].issues
 
 
 # ---------------------------------------------------------------------------

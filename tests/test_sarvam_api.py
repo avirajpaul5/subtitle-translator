@@ -7,6 +7,7 @@ from email.message import Message
 
 import pytest
 
+import subtitle_translator.translators.factory as translator_factory
 from subtitle_translator.credentials import get_sarvam_api_key
 from subtitle_translator.translators.base import BaseTranslator
 from subtitle_translator.translators.factory import TranslatorInitError, build_translator
@@ -233,6 +234,31 @@ def test_factory_builds_sarvam_with_explicit_key():
     assert translator.display_name == "Sarvam API (mayura:v1, classic-colloquial)"
 
 
+def test_factory_uses_tokenizer_only_checker_for_indic_fallback(monkeypatch):
+    created: list[str] = []
+
+    class _Checker:
+        def __init__(self, model_path: str) -> None:
+            created.append(model_path)
+
+        def accepts_input(self, text: str, source_lang: str, target_lang: str) -> bool:
+            return text != "too-many-tokens"
+
+    monkeypatch.setattr(translator_factory, "IndicTrans2InputChecker", _Checker)
+    translator = build_translator(
+        "sarvam-api",
+        model_path="/models/indic",
+        sarvam_api_key="test-key",
+        sarvam_use_keyring=False,
+        sarvam_fallback_backend="indictrans2",
+    )
+
+    assert translator.accepts_input("safe", "en", "bn")
+    assert not translator.accepts_input("too-many-tokens", "en", "bn")
+    assert created == ["/models/indic"]
+    assert translator._fallback is None
+
+
 class _FailingTranslator(BaseTranslator):
     def translate_batch(self, texts, source_lang: str, target_lang: str):
         raise RuntimeError("primary exploded")
@@ -272,6 +298,40 @@ def test_fallback_translator_reports_when_fallback_not_used():
     assert translator.translate_batch(["hello"], "en", "bn") == ["HELLO"]
     assert translator.fallback_count == 0
     assert translator.usage_summary == "UpperTranslator; fallback not used"
+
+
+def test_fallback_translator_exposes_the_stricter_input_cap():
+    primary = _UpperTranslator()
+    primary.max_input_chars = 1000
+    translator = FallbackTranslator(
+        primary,
+        lambda: _UpperTranslator(),
+        primary_name="Sarvam API",
+        fallback_name="indictrans2",
+        fallback_max_input_chars=500,
+    )
+
+    assert translator.max_input_chars == 500
+
+
+def test_fallback_translator_requires_fallback_exact_input_acceptance():
+    def _must_stay_lazy():
+        raise AssertionError("fallback model should remain lazy during planning")
+
+    translator = FallbackTranslator(
+        _UpperTranslator(),
+        _must_stay_lazy,
+        primary_name="Sarvam API",
+        fallback_name="indictrans2",
+        fallback_max_input_chars=500,
+        fallback_accepts_input=lambda text, source, target: "token-heavy" not in text,
+    )
+
+    # This is far below the character cap, but the fallback's exact token
+    # check still rejects it.
+    assert not translator.accepts_input("token-heavy", "en", "bn")
+    assert translator.accepts_input("safe", "en", "bn")
+    assert translator._fallback is None
 
 
 def test_fallback_translator_reports_primary_usage_in_warning():

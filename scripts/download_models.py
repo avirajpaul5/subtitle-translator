@@ -6,9 +6,9 @@ Run once on the machine where you'll use the GUI:
     python scripts/download_models.py --model 1B      # full IndicTrans2 1B (~4.5 GB)
     python scripts/download_models.py --model nllb    # NLLB-200 distilled 600M
 
-The destination path matches the default "Local model path" shown in the GUI,
-so no settings change is needed after download. Weights are not committed to
-git — the ./models/ directory is gitignored.
+The distilled default matches the GUI's initial model path. Other models use
+separate directories and the script prints the path to select after download.
+Weights are not committed to git — the ./models/ directory is gitignored.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ MODELS = {
     },
     "1B": {
         "repo_id": "ai4bharat/indictrans2-en-indic-1B",
-        "local_dir": "models/indictrans2-en-indic",
+        "local_dir": "models/indictrans2-en-indic-1B",
         "size_hint": "~4.5 GB",
         "backend": "indictrans2",
     },

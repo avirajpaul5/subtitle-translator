@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,22 @@ def test_translate_document_protects_do_not_translate():
     assert "Python" in combined
 
 
+def test_do_not_translate_wins_over_glossary_override():
+    doc = _mini_doc("doctor")
+
+    translated = translate_document(
+        document=doc,
+        translator=EchoTranslator(),
+        settings=TranslationSettings(),
+        glossary=GlossaryConfig(
+            glossary_map={"doctor": "ডাক্তার"},
+            do_not_translate=["doctor"],
+        ),
+    )
+
+    assert translated.cues[0].text == "doctor"
+
+
 def test_translate_document_vtt_roundtrip_structure():
     doc = _load("sample.vtt")
     translated = translate_document(
@@ -136,12 +153,30 @@ class _RecordingTranslator(BaseTranslator):
             raise RuntimeError("rate limit")
         materialized = list(texts)
         self.inputs.extend(materialized)
-        return [f"bn:{text}" for text in materialized]
+        return [
+            re.sub(r"(ZZID9\d{3}ZZ)\s*", r"\1 bn:", text)
+            if "ZZID9001ZZ" in text
+            else f"bn:{text}"
+            for text in materialized
+        ]
 
 
 class _ExplodingTranslator(BaseTranslator):
     def translate_batch(self, texts, source_lang: str, target_lang: str):
         raise AssertionError("translator should not be called")
+
+
+class _CrossCueSentinelTranslator(BaseTranslator):
+    def translate_batch(self, texts, source_lang: str, target_lang: str):
+        return [
+            text if "ZZID0ZZ" in text else "ID0ZZ"
+            for text in texts
+        ]
+
+
+class _DuplicatingSentinelTranslator(BaseTranslator):
+    def translate_batch(self, texts, source_lang: str, target_lang: str):
+        return [f"{text} ID0ZZ" for text in texts]
 
 
 def _mini_doc(*texts: str) -> SubtitleDocument:
@@ -172,7 +207,69 @@ def test_translate_document_skips_protected_only_text():
     assert translated.cues[0].text == "Monsieur"
 
 
-def test_translate_document_deduplicates_model_payloads():
+def test_subtitle_preserves_each_protected_term_spelling_and_case():
+    source = "MONSIEUR met Monsieur and monsieur."
+
+    translated = translate_document(
+        document=_mini_doc(source),
+        translator=EchoTranslator(),
+        settings=TranslationSettings(chunk_size=1),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=["Monsieur"]),
+    )
+
+    assert translated.cues[0].text == source
+
+
+def test_subtitle_short_protected_terms_do_not_collide_with_larger_words():
+    source = "Japan said Ja. Dada replied Da."
+
+    translated = translate_document(
+        document=_mini_doc(source),
+        translator=EchoTranslator(),
+        settings=TranslationSettings(chunk_size=1),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=["Ja", "Da"]),
+    )
+
+    assert translated.cues[0].text == source
+
+
+def test_translate_document_skips_verbatim_stage_direction_only_window():
+    doc = _mini_doc("(BELL TOLLING)")
+
+    translated = translate_document(
+        document=doc,
+        translator=_ExplodingTranslator(),
+        settings=TranslationSettings(chunk_size=1),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
+    )
+
+    assert translated.cues[0].text == "(BELL TOLLING)"
+
+
+def test_sentinel_restoration_is_scoped_to_the_source_cue():
+    translated = translate_document(
+        document=_mini_doc("Monsieur said.", "Hello."),
+        translator=_CrossCueSentinelTranslator(),
+        settings=TranslationSettings(context_window_cues=1),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=["Monsieur"]),
+    )
+
+    assert translated.cues[0].text == "Monsieur said."
+    assert translated.cues[1].text == "ID0ZZ"
+    assert any("cue 2: sentinel_debris" == warning for warning in translated.warnings)
+
+
+def test_extra_active_sentinel_copy_is_rejected():
+    with pytest.raises(TranslationInterruptedError, match="restored 2 time"):
+        translate_document(
+            document=_mini_doc("Monsieur said."),
+            translator=_DuplicatingSentinelTranslator(),
+            settings=TranslationSettings(),
+            glossary=GlossaryConfig({}, ["Monsieur"]),
+        )
+
+
+def test_translate_document_packs_adjacent_cues_into_one_context_payload():
     doc = _mini_doc("Hello there.", "Hello there.")
     translator = _RecordingTranslator()
 
@@ -183,19 +280,27 @@ def test_translate_document_deduplicates_model_payloads():
         glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
     )
 
-    assert translator.inputs == ["Hello there."]
+    assert translator.inputs == [
+        "ZZID9001ZZ Hello there.\nZZID9002ZZ Hello there."
+    ]
     assert [cue.text for cue in translated.cues] == ["bn:Hello there.", "bn:Hello there."]
 
 
 def test_translate_document_saves_checkpoint_and_resumes(tmp_path):
     doc = _mini_doc("First line.", "Second line.", "Third line.")
     checkpoint = tmp_path / "movie.checkpoint.json"
+    first_translator = _RecordingTranslator(fail_on_call=2)
+    first_translator.warnings = ["FALLBACK USED: first chunk used the backup model."]
 
     with pytest.raises(TranslationInterruptedError) as raised:
         translate_document(
             document=doc,
-            translator=_RecordingTranslator(fail_on_call=2),
-            settings=TranslationSettings(chunk_size=1),
+            translator=first_translator,
+            settings=TranslationSettings(
+                chunk_size=1,
+                context_window_chars=100,
+                context_window_cues=1,
+            ),
             glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
             checkpoint_path=checkpoint,
         )
@@ -209,7 +314,11 @@ def test_translate_document_saves_checkpoint_and_resumes(tmp_path):
     translated = translate_document(
         document=doc,
         translator=resume_translator,
-        settings=TranslationSettings(chunk_size=1),
+        settings=TranslationSettings(
+            chunk_size=1,
+            context_window_chars=100,
+            context_window_cues=1,
+        ),
         glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
         checkpoint_path=checkpoint,
     )
@@ -220,3 +329,74 @@ def test_translate_document_saves_checkpoint_and_resumes(tmp_path):
         "bn:Second line.",
         "bn:Third line.",
     ]
+    assert "FALLBACK USED: first chunk used the backup model." in translated.warnings
+
+
+class _AlignmentBreakingTranslator(BaseTranslator):
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def translate_batch(self, texts, source_lang: str, target_lang: str):
+        materialized = list(texts)
+        self.calls.append(materialized)
+        if any("ZZID9001ZZ" in text for text in materialized):
+            return ["একটি বাক্যে সব অনুবাদ"] * len(materialized)
+        return [f"bn:{text}" for text in materialized]
+
+
+def test_translate_document_never_accepts_missing_context_boundaries():
+    doc = _mini_doc("You knew", "he was lying,", "didn't you?")
+    translator = _AlignmentBreakingTranslator()
+
+    translated = translate_document(
+        document=doc,
+        translator=translator,
+        settings=TranslationSettings(context_window_chars=700, context_window_cues=8),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
+    )
+
+    assert [cue.text for cue in translated.cues] == [
+        "bn:You knew",
+        "bn:he was lying,",
+        "bn:didn't you?",
+    ]
+    assert all(cue.text for cue in translated.cues)
+    assert any("safely retried one at a time" in warning for warning in translated.warnings)
+    assert len(translator.calls) == 2
+
+
+def test_context_preprocessing_is_applied_per_cue_before_packing():
+    doc = _mini_doc("ALICE: Hello.", "BOB: Welcome.", "(BELL TOLLING)")
+    translator = _RecordingTranslator()
+
+    translated = translate_document(
+        document=doc,
+        translator=translator,
+        settings=TranslationSettings(context_window_chars=700, context_window_cues=8),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
+    )
+
+    model_payload = translator.inputs[0]
+    assert "ALICE:" not in model_payload
+    assert "BOB:" not in model_payload
+    assert "(bell tolling)" in model_payload
+    assert translated.cues[0].text == "ALICE: bn:Hello."
+    assert translated.cues[1].text == "BOB: bn:Welcome."
+    assert translated.cues[2].text == "(BELL TOLLING)"
+
+
+def test_context_preprocessing_looks_inside_wrapping_markup():
+    doc = _mini_doc("<i>POIROT: Hello.</i>", "<i>(BELL TOLLING)</i>")
+    translator = _RecordingTranslator()
+
+    translated = translate_document(
+        document=doc,
+        translator=translator,
+        settings=TranslationSettings(context_window_chars=700, context_window_cues=8),
+        glossary=GlossaryConfig(glossary_map={}, do_not_translate=[]),
+    )
+
+    assert "POIROT:" not in translator.inputs[0]
+    assert "(bell tolling)" in translator.inputs[0]
+    assert translated.cues[0].text == "<i>POIROT: bn:Hello.</i>"
+    assert translated.cues[1].text == "<i>(BELL TOLLING)</i>"

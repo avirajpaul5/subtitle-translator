@@ -4,7 +4,11 @@ from subtitle_translator.credentials import get_sarvam_api_key
 from subtitle_translator.translators.base import BaseTranslator
 from subtitle_translator.translators.echo import EchoTranslator
 from subtitle_translator.translators.fallback import FallbackTranslator
-from subtitle_translator.translators.indictrans2 import IndicTrans2Translator
+from subtitle_translator.translators.indictrans2 import (
+    IndicTrans2InputChecker,
+    IndicTrans2Translator,
+    _local_model_stamp,
+)
 from subtitle_translator.translators.nllb import NLLBTranslator
 from subtitle_translator.translators.sarvam_api import SarvamApiTranslator
 
@@ -62,6 +66,7 @@ def build_translator(
 
         if sarvam_fallback_backend:
             fallback_backend = sarvam_fallback_backend.lower()
+            fallback_checker: IndicTrans2InputChecker | None = None
 
             def _fallback_factory() -> BaseTranslator:
                 return build_translator(
@@ -71,11 +76,36 @@ def build_translator(
                     sarvam_use_keyring=False,
                 )
 
+            def _fallback_accepts_input(
+                text: str,
+                source_lang: str,
+                target_lang: str,
+            ) -> bool:
+                nonlocal fallback_checker
+                if fallback_backend != "indictrans2":
+                    return False
+                if fallback_checker is None:
+                    if not model_path:
+                        return False
+                    fallback_checker = IndicTrans2InputChecker(model_path)
+                return fallback_checker.accepts_input(
+                    text,
+                    source_lang,
+                    target_lang,
+                )
+
             return FallbackTranslator(
                 primary,
                 _fallback_factory,
                 primary_name="Sarvam API",
                 fallback_name=fallback_backend,
+                fallback_max_input_chars=(
+                    500 if fallback_backend == "indictrans2" else None
+                ),
+                fallback_checkpoint_fingerprint=(
+                    f"{fallback_backend}|model={_local_model_stamp(model_path or '')}"
+                ),
+                fallback_accepts_input=_fallback_accepts_input,
             )
 
         return primary

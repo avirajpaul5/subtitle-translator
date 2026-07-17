@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Pattern, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Corruption patterns
@@ -135,12 +135,52 @@ def _grammar_patterns(target_lang: str) -> List[Tuple[Pattern[str], str]]:
     return GRAMMAR_BY_LANG.get(target_lang, _UNIVERSAL_GRAMMAR)
 
 
-def flag_grammar_issues(text: str, target_lang: str = "") -> List[str]:
+def flag_grammar_issues(
+    text: str,
+    target_lang: str = "",
+    protected_terms: Iterable[str] = (),
+) -> List[str]:
+    # Intentional foreign phrases, titles, names, brands, and acronyms are not
+    # untranslated-word failures. Hide the exact protected phrases before the
+    # heuristic grammar scan so they do not create review noise.
+    scan_text = text
+    for term in sorted(
+        {term for term in protected_terms if term},
+        key=lambda value: (-len(value), value.casefold(), value),
+    ):
+        scan_text = re.sub(
+            rf"\b{re.escape(term)}\b",
+            "",
+            scan_text,
+            flags=re.IGNORECASE,
+        )
     labels: List[str] = []
     for pattern, label in _grammar_patterns(target_lang):
-        if pattern.search(text) and label not in labels:
+        if pattern.search(scan_text) and label not in labels:
             labels.append(label)
     return labels
+
+
+def flag_glossary_coverage(
+    original: str,
+    translated: str,
+    glossary_terms: Iterable[str],
+    protected_terms: Iterable[str] = (),
+) -> List[str]:
+    """Flag must-translate glossary terms that remain unchanged in output."""
+
+    protected = {term.casefold() for term in protected_terms if term}
+    flags: List[str] = []
+    for term in sorted(
+        {term for term in glossary_terms if term},
+        key=lambda value: (-len(value), value.casefold(), value),
+    ):
+        if term.casefold() in protected:
+            continue
+        pattern = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+        if pattern.search(original) and pattern.search(translated):
+            flags.append(f"glossary_term_untranslated:{term}")
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +205,8 @@ def validate_translation(
     translated_texts: Sequence[str],
     cue_numbers: Sequence[Optional[int]],
     target_lang: str = "",
+    glossary_terms: Iterable[str] = (),
+    protected_terms: Iterable[str] = (),
 ) -> List[ValidationIssue]:
     """Run every check against each cue. Returns one record per cue with at
     least one issue; cues that are clean don't appear in the list."""
@@ -174,7 +216,23 @@ def validate_translation(
     ):
         labels = _corruption_labels(trans, target_lang)
         labels.extend(
-            l for l in flag_grammar_issues(trans, target_lang) if l not in labels
+            l
+            for l in flag_grammar_issues(
+                trans,
+                target_lang,
+                protected_terms=protected_terms,
+            )
+            if l not in labels
+        )
+        labels.extend(
+            label
+            for label in flag_glossary_coverage(
+                orig,
+                trans,
+                glossary_terms,
+                protected_terms,
+            )
+            if label not in labels
         )
         if labels:
             out.append(ValidationIssue(

@@ -19,12 +19,20 @@ class FallbackTranslator(BaseTranslator):
         *,
         primary_name: str,
         fallback_name: str,
+        fallback_max_input_chars: int | None = None,
+        fallback_checkpoint_fingerprint: str | None = None,
+        fallback_accepts_input: Callable[[str, str, str], bool] | None = None,
     ) -> None:
         self.primary = primary
         self._fallback_factory = fallback_factory
         self._fallback: BaseTranslator | None = None
         self.primary_name = primary_name
         self.fallback_name = fallback_name
+        self.fallback_max_input_chars = fallback_max_input_chars
+        self.fallback_checkpoint_fingerprint = (
+            fallback_checkpoint_fingerprint or fallback_name
+        )
+        self._fallback_accepts_input = fallback_accepts_input
         self.warnings: list[str] = []
         self.fallback_count = 0
         self._last_used_name = primary.display_name
@@ -64,9 +72,51 @@ class FallbackTranslator(BaseTranslator):
         return f"{self.primary.display_name} (fallback: {self.fallback_name})"
 
     @property
+    def checkpoint_fingerprint(self) -> str:
+        return (
+            f"primary={self.primary.checkpoint_fingerprint}|"
+            f"fallback={self.fallback_checkpoint_fingerprint}|"
+            f"fallback_cap={self.fallback_max_input_chars}"
+        )
+
+    @property
     def pipeline_chunk_size(self) -> int | None:
         value = getattr(self.primary, "pipeline_chunk_size", None)
         return int(value) if isinstance(value, int) and value > 0 else None
+
+    @property
+    def max_input_chars(self) -> int | None:
+        limits = [
+            value
+            for value in (
+                getattr(self.primary, "max_input_chars", None),
+                self.fallback_max_input_chars,
+            )
+            if isinstance(value, int) and value > 0
+        ]
+        return min(limits) if limits else None
+
+    def accepts_input(self, text: str, source_lang: str, target_lang: str) -> bool:
+        """Accept a payload only when both possible execution paths do.
+
+        A fallback batch must be safe to send to either backend. Character
+        caps provide an inexpensive first check, while each translator's
+        tokenizer-aware check remains authoritative.
+        """
+
+        max_chars = self.max_input_chars
+        if isinstance(max_chars, int) and len(text) > max_chars:
+            return False
+        if not self.primary.accepts_input(text, source_lang, target_lang):
+            return False
+        if self._fallback_accepts_input is not None:
+            return self._fallback_accepts_input(text, source_lang, target_lang)
+        if self._fallback is not None:
+            return self._fallback.accepts_input(text, source_lang, target_lang)
+        # Do not instantiate an expensive fallback model just to plan a
+        # primary-provider request. Without an exact capability callback, we
+        # cannot safely claim that both paths accept this payload.
+        return False
 
     @property
     def last_used_name(self) -> str:

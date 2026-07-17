@@ -12,6 +12,10 @@ class GlossaryConfig:
     do_not_translate: List[str]
 
 
+class ProtectedTermAlignmentError(ValueError):
+    pass
+
+
 def load_glossary_json(raw_text: str | None) -> GlossaryConfig:
     if not raw_text:
         return GlossaryConfig(glossary_map={}, do_not_translate=[])
@@ -38,6 +42,7 @@ def load_glossary_json(raw_text: str | None) -> GlossaryConfig:
 # through untouched.
 _SENTINEL_PREFIX = "ZZID"
 _SENTINEL_SUFFIX = "ZZ"
+_CANONICAL_SENTINEL_RE = re.compile(r"ZZID\d+ZZ")
 
 
 def _sentinel(n: int) -> str:
@@ -48,26 +53,46 @@ def protect_terms(texts: Iterable[str], terms: List[str]) -> Tuple[List[str], Di
     """Replace each term with a ZZID{n}ZZ sentinel.
 
     Returns the substituted texts plus a replacements map (sentinel → original)
-    that `restore_terms` uses to put the originals back. The same term across
-    different texts gets the same sentinel ID so the map stays compact.
+    that `restore_terms` uses to put the originals back. Identically-spelled
+    occurrences share a sentinel, but each distinct spelling/case gets its own
+    entry so restoration never normalizes the source author's capitalization.
     """
     if not terms:
         return list(texts), {}
 
-    ordered = sorted({t for t in terms if t}, key=len, reverse=True)
-    term_to_sentinel: Dict[str, str] = {
-        term: _sentinel(i) for i, term in enumerate(ordered)
-    }
+    materialized = list(texts)
+    ordered = sorted(
+        {term for term in terms if term},
+        key=lambda term: (-len(term), term.casefold(), term),
+    )
+    # Allocate IDs only for spellings that actually occur. Registering every
+    # built-in DNT term made an unrelated model hallucination such as ID0ZZ
+    # restore into a plausible-looking proper noun that validation could no
+    # longer detect.
+    original_to_sentinel: Dict[str, str] = {}
+    replacements: Dict[str, str] = {}
+
+    def protect_match(match: re.Match[str]) -> str:
+        original = match.group(0)
+        sentinel = original_to_sentinel.get(original)
+        if sentinel is None:
+            sentinel = _sentinel(len(original_to_sentinel))
+            original_to_sentinel[original] = sentinel
+            replacements[sentinel] = original
+        # Pad with spaces so the model is less likely to fuse the sentinel
+        # with neighbouring tokens (it was producing things like
+        # `MENID209ZZ` and `USID134ZZHuh` without the padding).
+        return f" {sentinel} "
 
     protected: List[str] = []
-    for text in texts:
+    for text in materialized:
         out = text
-        for term, sentinel in term_to_sentinel.items():
-            # Pad with spaces so the model is less likely to fuse the
-            # sentinel with neighbouring tokens (it was producing things
-            # like `MENID209ZZ` and `USID134ZZHuh` without the padding).
+        for term in ordered:
             out = re.sub(
-                rf"\b{re.escape(term)}\b", f" {sentinel} ", out, flags=re.IGNORECASE
+                rf"\b{re.escape(term)}\b",
+                protect_match,
+                out,
+                flags=re.IGNORECASE,
             )
         # Collapse the runs of spaces we just introduced.
         out = re.sub(r"[ \t]{2,}", " ", out).strip()
@@ -75,7 +100,6 @@ def protect_terms(texts: Iterable[str], terms: List[str]) -> Tuple[List[str], Di
         out = re.sub(r"\s+([,.;:!?])", r"\1", out)
         protected.append(out)
 
-    replacements = {sentinel: term for term, sentinel in term_to_sentinel.items()}
     return protected, replacements
 
 
@@ -138,11 +162,24 @@ def _lookup(idx_str: str, replacements: Dict[str, str]) -> str | None:
         return None
 
 
-def restore_terms(texts: Iterable[str], replacements: Dict[str, str]) -> List[str]:
+def restore_terms(
+    texts: Iterable[str],
+    replacements: Dict[str, str],
+    *,
+    normalize_spacing: bool = True,
+) -> List[str]:
     """Substitute sentinels back, handling letter-fusion and target-script
-    transliteration of the sentinel itself."""
+    transliteration of the sentinel itself.
+
+    Subtitle output uses the default spacing cleanup. Structured-document
+    callers can disable it so repeated spaces and tabs remain intact outside
+    the protected sentinel itself.
+    """
     if not replacements:
-        return [t.strip() for t in texts]
+        return [t.strip() if normalize_spacing else t for t in texts]
+
+    def _restored(value: str) -> str:
+        return f" {value} " if normalize_spacing else value
 
     def _sub_latin(match: re.Match) -> str:
         idx = match.group(1) or match.group(2)
@@ -161,12 +198,12 @@ def restore_terms(texts: Iterable[str], replacements: Dict[str, str]) -> List[st
             prefix and len(saved_words) > 1
             and prefix.lower() == saved_words[-1].lower()
         ):
-            return " " + saved_words[-1] + " "
-        return " " + saved + " "
+            return _restored(saved_words[-1])
+        return _restored(saved)
 
     def _sub_indic(match: re.Match) -> str:
         saved = _lookup(match.group(1), replacements)
-        return " " + (saved or "") + " "
+        return _restored(saved or "")
 
     result: List[str] = []
     for text in texts:
@@ -182,11 +219,54 @@ def restore_terms(texts: Iterable[str], replacements: Dict[str, str]) -> List[st
         # Pass 4: nuke any leftover sentinel-like debris (indices we never
         # assigned, or shapes the above passes couldn't restore).
         text = _ORPHAN_RE.sub("", text)
-        # Tidy spacing.
-        text = re.sub(r"[ \t]{2,}", " ", text)
-        text = re.sub(r"\s+([,.;:!?।])", r"\1", text)
-        result.append(text.strip())
+        if normalize_spacing:
+            text = re.sub(r"[ \t]{2,}", " ", text)
+            text = re.sub(r"\s+([,.;:!?।])", r"\1", text)
+            text = text.strip()
+        result.append(text)
     return result
+
+
+def validate_restored_terms(
+    protected_source: str,
+    restored_text: str,
+    replacements: Dict[str, str],
+) -> None:
+    """Require every active placeholder to restore exactly as many times as sent."""
+
+    for sentinel, original in replacements.items():
+        expected = protected_source.count(sentinel)
+        pattern = _restored_content_pattern(original)
+        actual = len(pattern.findall(restored_text))
+        if actual != expected:
+            raise ProtectedTermAlignmentError(
+                f"Protected content {original!r} restored {actual} time(s); "
+                f"expected {expected}. The translation was not accepted."
+            )
+
+    expected_order = [
+        match.group(0)
+        for match in _CANONICAL_SENTINEL_RE.finditer(protected_source)
+        if match.group(0) in replacements
+    ]
+    cursor = 0
+    for sentinel in expected_order:
+        original = replacements[sentinel]
+        match = _restored_content_pattern(original).search(restored_text, cursor)
+        if match is None:
+            raise ProtectedTermAlignmentError(
+                "Protected content was reordered during translation. "
+                "The translation was not accepted."
+            )
+        cursor = match.end()
+
+
+def _restored_content_pattern(original: str) -> re.Pattern[str]:
+    if original and original[0].isalnum() and original[-1].isalnum():
+        # Protection itself uses word boundaries. Apply the same contract here
+        # so a short term such as ``Ja`` is not counted inside ``Japan``.
+        return re.compile(rf"(?<!\w){re.escape(original)}(?!\w)")
+    return re.compile(re.escape(original))
 
 
 def apply_glossary_overrides(texts: Iterable[str], glossary_map: Dict[str, str]) -> List[str]:
